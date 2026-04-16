@@ -75,10 +75,6 @@ pub struct GarbageCollectorConfig {
     pub log: LogConfig,
     #[serde(default)]
     pub enable_dangerous_option_to_ignore_min_versions_for_wal3: bool,
-    #[serde(default = "GarbageCollectorConfig::default_heap_prune_buckets_to_read")]
-    pub heap_prune_buckets_to_read: u32,
-    #[serde(default = "GarbageCollectorConfig::default_heap_prune_max_items")]
-    pub heap_prune_max_items: u32,
     #[serde(default = "GarbageCollectorConfig::default_max_attached_functions_to_gc_per_run")]
     pub max_attached_functions_to_gc_per_run: i32,
 }
@@ -135,14 +131,6 @@ impl GarbageCollectorConfig {
 
     fn default_attached_function_soft_delete_grace_period() -> Duration {
         Duration::from_secs(60 * 60 * 24) // 1 day
-    }
-
-    fn default_heap_prune_buckets_to_read() -> u32 {
-        10 // Scan up to 10 time buckets per shard
-    }
-
-    fn default_heap_prune_max_items() -> u32 {
-        10000 // Prune up to 10k items per shard per GC pass
     }
 
     fn default_max_attached_functions_to_gc_per_run() -> i32 {
