@@ -1,4 +1,4 @@
-use crate::garbage_collector_orchestrator_v2::GarbageCollectorError;
+use crate::garbage_collector_orchestrator::GarbageCollectorError;
 use crate::operators::delete_unused_logs::{
     DeleteUnusedLogsError, DeleteUnusedLogsInput, DeleteUnusedLogsOperator, DeleteUnusedLogsOutput,
 };
@@ -95,7 +95,7 @@ impl HardDeleteLogOnlyGarbageCollectorOrchestrator {
         let task = wrap(
             Box::new(DeleteUnusedLogsOperator {
                 enabled: true,
-                mode: CleanupMode::DeleteV2,
+                mode: CleanupMode::Delete,
                 storage: self.storage.clone(),
                 logs: self.logs.clone(),
                 enable_dangerous_option_to_ignore_min_versions_for_wal3: false,
@@ -136,7 +136,6 @@ impl Handler<TaskResult<DeleteUnusedLogsOutput, DeleteUnusedLogsError>>
                 collection_id: self.collection_to_destroy,
                 num_versions_deleted: 0,
                 num_files_deleted: 0,
-                ..Default::default()
             }),
             ctx,
         )
@@ -222,7 +221,7 @@ mod tests {
     /// When the orchestrator starts the delete operator (in `try_start_delete_unused_logs_operator`),
     /// it uses the following hardcoded configuration:
     /// - `enabled`: true (operator is active)
-    /// - `mode`: `CleanupMode::DeleteV2` (performs hard deletion)
+    /// - `mode`: `CleanupMode::Delete` (performs hard deletion)
     /// - `enable_dangerous_option_to_ignore_min_versions_for_wal3`: false (safety check enabled)
     ///
     /// The collection UUID stored in `collection_to_destroy` is placed in the

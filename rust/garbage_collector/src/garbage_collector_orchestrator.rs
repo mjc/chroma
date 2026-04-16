@@ -407,7 +407,6 @@ impl GarbageCollectorOrchestrator {
                 num_versions_deleted: 0,
                 num_files_deleted: 0,
                 collection_id: self.collection_id,
-                ..Default::default()
             };
             self.terminate_with_result(Ok(response), ctx).await;
             return Ok(());
@@ -805,7 +804,6 @@ impl GarbageCollectorOrchestrator {
             Box::new(DeleteUnusedFilesOperator::new(
                 self.storage.clone(),
                 self.cleanup_mode,
-                tenant_id,
             )),
             DeleteUnusedFilesInput {
                 unused_s3_files: file_paths_to_delete,
@@ -833,13 +831,12 @@ impl GarbageCollectorOrchestrator {
             return Ok(());
         }
 
-        if self.cleanup_mode == CleanupMode::DryRunV2 {
+        if self.cleanup_mode == CleanupMode::DryRun {
             tracing::info!("Dry run mode, skipping actual deletion");
             let response = GarbageCollectorResponse {
                 num_versions_deleted: 0,
                 num_files_deleted: 0,
                 collection_id: self.collection_id,
-                ..Default::default()
             };
             self.terminate_with_result(Ok(response), ctx).await;
             return Ok(());
@@ -887,7 +884,6 @@ impl GarbageCollectorOrchestrator {
                 num_versions_deleted: 0,
                 num_files_deleted: 0,
                 collection_id: self.collection_id,
-                ..Default::default()
             };
             self.terminate_with_result(Ok(response), ctx).await;
             return Ok(());
@@ -1017,7 +1013,6 @@ impl GarbageCollectorOrchestrator {
                 num_files_deleted: self.num_files_deleted,
                 num_versions_deleted: self.num_versions_deleted,
                 collection_id: self.collection_id,
-                ..Default::default()
             };
 
             self.terminate_with_result(Ok(response), ctx).await;
@@ -1323,7 +1318,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Create v2 with file paths
+        // Create v2 of the collection with file paths
         sysdb
             .flush_compaction(
                 tenant.clone(),
@@ -1395,7 +1390,7 @@ mod tests {
             storage,
             logs,
             root_manager,
-            crate::types::CleanupMode::DeleteV2,
+            crate::types::CleanupMode::Delete,
             1,
             true,
             false,
