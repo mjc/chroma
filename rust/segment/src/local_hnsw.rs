@@ -1,6 +1,7 @@
 use std::{
     collections::{BinaryHeap, HashMap},
     io::Write,
+    num::NonZeroI32,
     path::Path,
     sync::Arc,
 };
@@ -54,6 +55,8 @@ pub enum LocalHnswSegmentReaderError {
     QueryError,
     #[error("Error reading from sqlite: {0}")]
     SqliteError(#[from] sqlx::error::Error),
+    #[error("Invalid persisted local HNSW metadata: {0}")]
+    InvalidPersistedMetadata(String),
 }
 
 impl ChromaError for LocalHnswSegmentReaderError {
@@ -70,8 +73,53 @@ impl ChromaError for LocalHnswSegmentReaderError {
             LocalHnswSegmentReaderError::GetEmbeddingError => ErrorCodes::Internal,
             LocalHnswSegmentReaderError::QueryError => ErrorCodes::Internal,
             LocalHnswSegmentReaderError::SqliteError(_) => ErrorCodes::Internal,
+            LocalHnswSegmentReaderError::InvalidPersistedMetadata(_) => ErrorCodes::Internal,
         }
     }
+}
+
+#[derive(Debug)]
+enum ValidatedIdMap {
+    Uninitialized,
+    Initialized {
+        id_map: IdMap,
+        dimensionality: NonZeroI32,
+    },
+}
+
+fn validate_persisted_id_map(
+    id_map: IdMap,
+    expected_dimensionality: usize,
+) -> Result<ValidatedIdMap, String> {
+    if id_map.id_to_label.is_empty() {
+        return Ok(ValidatedIdMap::Uninitialized);
+    }
+
+    let persisted_dimensionality = id_map
+        .dimensionality
+        .unwrap_or(expected_dimensionality);
+
+    if persisted_dimensionality == 0 {
+        return Err("segment has persisted labels but dimensionality is 0".to_string());
+    }
+
+    if persisted_dimensionality != expected_dimensionality {
+        return Err(format!(
+            "persisted dimensionality {} does not match collection dimensionality {}",
+            persisted_dimensionality, expected_dimensionality
+        ));
+    }
+
+    let persisted_dimensionality = i32::try_from(persisted_dimensionality).map_err(|_| {
+        "persisted dimensionality exceeds the range supported by the HNSW index".to_string()
+    })?;
+    let persisted_dimensionality = NonZeroI32::new(persisted_dimensionality)
+        .expect("persisted dimensionality was already checked to be non-zero");
+
+    Ok(ValidatedIdMap::Initialized {
+        id_map,
+        dimensionality: persisted_dimensionality,
+    })
 }
 
 async fn get_current_seq_id(
@@ -132,41 +180,49 @@ impl LocalHnswSegmentReader {
                         .into_std()
                         .await;
                     let id_map: IdMap = serde_pickle::from_reader(file, DeOptions::new())?;
-                    if !id_map.id_to_label.is_empty() {
-                        // Load hnsw index.
-                        let index_config = IndexConfig::new(
-                            dimensionality as i32,
-                            hnsw_configuration.space.clone().into(),
-                        );
-                        let index = HnswIndex::load(
-                            index_folder_str,
-                            &index_config,
-                            hnsw_configuration.ef_search,
-                            chroma_index::IndexUuid(segment.id.0),
-                        )
-                        .map_err(|_| LocalHnswSegmentReaderError::HnswIndexLoadError)?;
+                    match validate_persisted_id_map(id_map, dimensionality)
+                        .map_err(LocalHnswSegmentReaderError::InvalidPersistedMetadata)?
+                    {
+                        ValidatedIdMap::Initialized {
+                            id_map,
+                            dimensionality: persisted_dimensionality,
+                        } => {
+                            // Load hnsw index.
+                            let index_config = IndexConfig::new(
+                                persisted_dimensionality.get(),
+                                hnsw_configuration.space.clone().into(),
+                            );
+                            let index = HnswIndex::load(
+                                index_folder_str,
+                                &index_config,
+                                hnsw_configuration.ef_search,
+                                chroma_index::IndexUuid(segment.id.0),
+                            )
+                            .map_err(|_| LocalHnswSegmentReaderError::HnswIndexLoadError)?;
 
-                        let current_seq_id = get_current_seq_id(segment, &sql_db).await?;
+                            let current_seq_id = get_current_seq_id(segment, &sql_db).await?;
 
-                        // TODO(Sanket): Set allow reset appropriately.
-                        return Ok(Self {
-                            index: LocalHnswIndex {
-                                inner: Arc::new(tokio::sync::RwLock::new(Inner {
-                                    index,
-                                    id_map,
-                                    index_init: true,
-                                    allow_reset: false,
-                                    num_elements_since_last_persist: 0,
-                                    last_seen_seq_id: current_seq_id,
-                                    sync_threshold: hnsw_configuration.sync_threshold,
-                                    persist_path: Some(index_folder_str.to_string()),
-                                    sqlite: sql_db,
-                                })),
-                            },
-                        });
-                    } else {
-                        // An empty reader.
-                        return Err(LocalHnswSegmentReaderError::UninitializedSegment);
+                            // TODO(Sanket): Set allow reset appropriately.
+                            return Ok(Self {
+                                index: LocalHnswIndex {
+                                    inner: Arc::new(tokio::sync::RwLock::new(Inner {
+                                        index,
+                                        id_map,
+                                        index_init: true,
+                                        allow_reset: false,
+                                        num_elements_since_last_persist: 0,
+                                        last_seen_seq_id: current_seq_id,
+                                        sync_threshold: hnsw_configuration.sync_threshold,
+                                        persist_path: Some(index_folder_str.to_string()),
+                                        sqlite: sql_db,
+                                    })),
+                                },
+                            });
+                        }
+                        ValidatedIdMap::Uninitialized => {
+                            // An empty reader.
+                            return Err(LocalHnswSegmentReaderError::UninitializedSegment);
+                        }
                     }
                 }
                 // Return uninitialized reader.
@@ -521,7 +577,12 @@ impl LocalHnswSegmentWriter {
                         .into_std()
                         .await;
                     let id_map: IdMap = serde_pickle::from_reader(file, DeOptions::new())?;
-                    if !id_map.id_to_label.is_empty() {
+                    if let ValidatedIdMap::Initialized {
+                        id_map,
+                        dimensionality: persisted_dimensionality,
+                    } = validate_persisted_id_map(id_map, dimensionality)
+                        .map_err(LocalHnswSegmentWriterError::InvalidPersistedMetadata)?
+                    {
                         // Migrate legacy max_seq_id if present
                         if let Some(max_seq_id) = id_map.max_seq_id {
                             let id = segment.id.to_string().into();
@@ -542,7 +603,7 @@ impl LocalHnswSegmentWriter {
                         }
                         // Load hnsw index.
                         let index_config = IndexConfig::new(
-                            dimensionality as i32,
+                            persisted_dimensionality.get(),
                             hnsw_configuration.space.clone().into(),
                         );
                         let index = HnswIndex::load(
@@ -882,6 +943,102 @@ async fn persist(
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        validate_persisted_id_map, DeOptions, IdMap, LocalHnswSegmentReader,
+        LocalHnswSegmentReaderError, LocalHnswSegmentWriter, LocalHnswSegmentWriterError,
+        SerOptions, ValidatedIdMap, METADATA_FILE,
+    };
+    use chroma_config::{registry::Registry, Configurable};
+    use chroma_sqlite::config::{MigrationHash, MigrationMode, SqliteDBConfig};
+    use chroma_sqlite::db::SqliteDb;
+    use chroma_types::{test_segment, Collection, KnnIndex, Schema, Segment, SegmentScope};
+    use std::collections::HashMap;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn populated_id_map(dimensionality: Option<usize>) -> IdMap {
+        IdMap {
+            dimensionality,
+            total_elements_added: 1,
+            max_seq_id: None,
+            id_to_label: HashMap::from([(String::from("a"), 1)]),
+            label_to_id: HashMap::from([(1, String::from("a"))]),
+            id_to_seq_id: HashMap::from([(String::from("a"), 1)]),
+        }
+    }
+
+    #[test]
+    fn persisted_id_map_accepts_legacy_metadata_without_dimensionality() {
+        let id_map = populated_id_map(None);
+
+        match validate_persisted_id_map(id_map, 3).unwrap() {
+            ValidatedIdMap::Initialized { dimensionality, .. } => {
+                assert_eq!(dimensionality.get(), 3)
+            }
+            ValidatedIdMap::Uninitialized => panic!("id map should be initialized"),
+        }
+    }
+
+    #[test]
+    fn persisted_id_map_rejects_dimensionality_mismatch() {
+        let id_map = populated_id_map(Some(8));
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("does not match"));
+    }
+
+    #[test]
+    fn persisted_id_map_rejects_zero_dimensionality_when_labels_exist() {
+        let id_map = populated_id_map(Some(0));
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("dimensionality is 0"));
+    }
+
+    #[test]
+    fn persisted_id_map_rejects_dimensionality_outside_hnsw_range() {
+        let id_map = populated_id_map(Some(i32::MAX as usize + 1));
+
+        let err = validate_persisted_id_map(id_map, i32::MAX as usize + 1).unwrap_err();
+        assert!(err.contains("exceeds the range"));
+    }
+
+    #[test]
+    fn persisted_id_map_accepts_matching_dimensionality() {
+        let id_map = populated_id_map(Some(3));
+
+        match validate_persisted_id_map(id_map, 3).unwrap() {
+            ValidatedIdMap::Initialized { dimensionality, .. } => {
+                assert_eq!(dimensionality.get(), 3)
+            }
+            ValidatedIdMap::Uninitialized => panic!("id map should be initialized"),
+        }
+    }
+
+    #[test]
+    fn empty_persisted_id_map_can_stay_uninitialized() {
+        let id_map = IdMap::default();
+
+        match validate_persisted_id_map(id_map, 3).unwrap() {
+            ValidatedIdMap::Uninitialized => {}
+            ValidatedIdMap::Initialized { .. } => panic!("id map should be uninitialized"),
+        }
+    }
+
+    #[test]
+    fn persisted_id_map_accepts_legacy_metadata_after_pickle_deserialization() {
+        let pickle = serde_pickle::to_vec(&populated_id_map(None), SerOptions::new()).unwrap();
+        let id_map: IdMap =
+            serde_pickle::from_slice(&pickle, DeOptions::new()).expect("pickle should deserialize");
+
+        match validate_persisted_id_map(id_map, 3).unwrap() {
+            ValidatedIdMap::Initialized { dimensionality, .. } => {
+                assert_eq!(dimensionality.get(), 3)
+            }
+            ValidatedIdMap::Uninitialized => panic!("id map should be initialized"),
+        }
+    }
+
     #[test]
     fn persistable_index_dimensionality_rejects_non_positive_values() {
         assert!(super::persistable_index_dimensionality(0).is_err());
@@ -891,5 +1048,90 @@ mod tests {
     #[test]
     fn persistable_index_dimensionality_accepts_positive_values() {
         assert_eq!(super::persistable_index_dimensionality(384).unwrap(), 384);
+    }
+
+    fn test_collection_and_segment() -> (Collection, Segment) {
+        let mut collection = Collection::test_collection(3);
+        collection.schema = Some(Schema::new_default(KnnIndex::Hnsw));
+        let segment = test_segment(collection.collection_id, SegmentScope::VECTOR);
+        (collection, segment)
+    }
+
+    fn persist_id_map(id_map: &IdMap, segment: &Segment) -> tempfile::TempDir {
+        let persist_root = tempdir().expect("persist root should be created");
+        let index_folder = persist_root.path().join(segment.id.to_string());
+        fs::create_dir(&index_folder).expect("index folder should be created");
+        let metadata_file = index_folder.join(METADATA_FILE);
+        let mut file = fs::File::create(metadata_file).expect("metadata file should be created");
+        serde_pickle::to_writer(&mut file, id_map, SerOptions::new())
+            .expect("id map should serialize");
+        persist_root
+    }
+
+    async fn new_sqlite_db() -> SqliteDb {
+        let db_dir = tempdir()
+            .expect("sqlite temp dir should be created")
+            .keep();
+        let db_path = db_dir.join("chroma.sqlite3");
+        let config = SqliteDBConfig {
+            url: Some(db_path.to_string_lossy().into_owned()),
+            hash_type: MigrationHash::MD5,
+            migration_mode: MigrationMode::Apply,
+        };
+        SqliteDb::try_from_config(&config, &Registry::new())
+            .await
+            .expect("sqlite db should be created")
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_invalid_persisted_metadata_before_loading_hnsw_index() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = persist_id_map(&populated_id_map(Some(0)), &segment);
+        let sqlite = new_sqlite_db().await;
+
+        let result = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root.path().to_string_lossy().into_owned()),
+            sqlite,
+        )
+        .await;
+
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("invalid metadata should be rejected"),
+        };
+        assert!(matches!(
+            err,
+            LocalHnswSegmentReaderError::InvalidPersistedMetadata(message)
+                if message.contains("dimensionality is 0")
+        ));
+    }
+
+    #[tokio::test]
+    async fn writer_rejects_invalid_persisted_metadata_before_loading_hnsw_index() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = persist_id_map(&populated_id_map(Some(0)), &segment);
+        let sqlite = new_sqlite_db().await;
+
+        let result = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root.path().to_string_lossy().into_owned()),
+            sqlite,
+        )
+        .await;
+
+        let err = match result {
+            Err(err) => err,
+            Ok(_) => panic!("invalid metadata should be rejected"),
+        };
+        assert!(matches!(
+            err,
+            LocalHnswSegmentWriterError::InvalidPersistedMetadata(message)
+                if message.contains("dimensionality is 0")
+        ));
     }
 }
