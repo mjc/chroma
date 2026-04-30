@@ -1,0 +1,133 @@
+import pickle
+
+import pytest
+
+from chromadb.segment.impl.vector.local_persistent_hnsw import (
+    PersistentData,
+    _validate_persisted_data,
+)
+
+
+def _persistent_data(dimensionality):
+    return PersistentData(
+        dimensionality=dimensionality,
+        total_elements_added=1,
+        id_to_label={"a": 1},
+        label_to_id={1: "a"},
+        id_to_seq_id={"a": 1},
+    )
+
+
+@pytest.mark.parametrize("dimensionality", [None, 0, -1, True, 1.5, "3"])
+def test_validate_persisted_data_rejects_invalid_dimensionality_when_labels_exist(
+    dimensionality,
+):
+    with pytest.raises(ValueError, match="dimensionality"):
+        _validate_persisted_data(_persistent_data(dimensionality))
+
+
+@pytest.mark.parametrize("dimensionality", [1, 3, 384])
+def test_validate_persisted_data_allows_valid_dimensionality_when_labels_exist(
+    dimensionality,
+):
+    _validate_persisted_data(_persistent_data(dimensionality))
+
+
+def test_validate_persisted_data_uses_expected_dimensionality_for_legacy_metadata():
+    data = _persistent_data(None)
+
+    _validate_persisted_data(data, expected_dimensionality=5)
+
+    assert data.dimensionality == 5
+
+
+def test_validate_persisted_data_rejects_mismatched_expected_dimensionality():
+    with pytest.raises(ValueError, match="does not match the collection dimensionality"):
+        _validate_persisted_data(_persistent_data(5), expected_dimensionality=3)
+
+
+@pytest.mark.parametrize("dimensionality", [None, 0, -1])
+def test_validate_persisted_data_allows_empty_label_map_without_dimensionality(
+    dimensionality,
+):
+    data = PersistentData(
+        dimensionality=dimensionality,
+        total_elements_added=0,
+        id_to_label={},
+        label_to_id={},
+        id_to_seq_id={},
+    )
+
+    _validate_persisted_data(data)
+
+
+@pytest.mark.parametrize("dimensionality", [None, 0, -1, True, 1.5, "3"])
+def test_load_from_file_rejects_invalid_dimensionality_when_labels_exist(
+    tmp_path, dimensionality
+):
+    path = tmp_path / "index_metadata.pickle"
+    with path.open("wb") as f:
+        pickle.dump(_persistent_data(dimensionality), f, pickle.HIGHEST_PROTOCOL)
+
+    with pytest.raises(ValueError, match="dimensionality"):
+        PersistentData.load_from_file(str(path))
+
+
+def test_load_from_file_allows_empty_label_map_without_dimensionality(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    with path.open("wb") as f:
+        pickle.dump(
+            PersistentData(
+                dimensionality=None,
+                total_elements_added=0,
+                id_to_label={},
+                label_to_id={},
+                id_to_seq_id={},
+            ),
+            f,
+            pickle.HIGHEST_PROTOCOL,
+        )
+
+    loaded = PersistentData.load_from_file(str(path))
+    assert loaded.dimensionality is None
+    assert loaded.id_to_label == {}
+
+
+def test_load_from_file_allows_valid_dimensionality_when_labels_exist(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    with path.open("wb") as f:
+        pickle.dump(
+            PersistentData(
+                dimensionality=5,
+                total_elements_added=1,
+                id_to_label={"a": 1},
+                label_to_id={1: "a"},
+                id_to_seq_id={"a": 1},
+            ),
+            f,
+            pickle.HIGHEST_PROTOCOL,
+        )
+
+    loaded = PersistentData.load_from_file(str(path))
+    assert loaded.dimensionality == 5
+    assert loaded.id_to_label == {"a": 1}
+
+
+def test_load_from_file_uses_expected_dimensionality_for_legacy_metadata(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    with path.open("wb") as f:
+        pickle.dump(_persistent_data(None), f, pickle.HIGHEST_PROTOCOL)
+
+    loaded = PersistentData.load_from_file(str(path), expected_dimensionality=7)
+
+    assert loaded.dimensionality == 7
+    assert loaded.id_to_label == {"a": 1}
+
+
+def test_load_from_file_rejects_mismatched_expected_dimensionality(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    with path.open("wb") as f:
+        pickle.dump(_persistent_data(7), f, pickle.HIGHEST_PROTOCOL)
+
+    with pytest.raises(ValueError, match="does not match the collection dimensionality"):
+        PersistentData.load_from_file(str(path), expected_dimensionality=3)

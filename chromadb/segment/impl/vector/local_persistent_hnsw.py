@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Sequence, Set, cast
 from chromadb.config import System
 from chromadb.db.base import ParameterValue, get_sql
 from chromadb.db.impl.sqlite import SqliteDB
+from chromadb.db.system import SysDB
 from chromadb.segment.impl.vector.batch import Batch
 from chromadb.segment.impl.vector.hnsw_params import PersistentHnswParams
 from chromadb.segment.impl.vector.local_hnsw import (
@@ -41,6 +42,47 @@ from chromadb.utils.read_write_lock import ReadRWLock, WriteRWLock
 logger = logging.getLogger(__name__)
 
 
+def _is_valid_dimensionality(dimensionality: Optional[int]) -> bool:
+    return (
+        not isinstance(dimensionality, bool)
+        and isinstance(dimensionality, int)
+        and dimensionality > 0
+    )
+
+
+def _validate_persisted_data(
+    data: "PersistentData", expected_dimensionality: Optional[int] = None
+) -> None:
+    """Reject persisted metadata that would crash or misconfigure index reload.
+
+    A persisted HNSW segment with label mappings but no valid dimensionality is
+    not recoverable at load time. The legacy code would blindly cast and pass
+    the value into hnswlib initialization, which can explode deeper in the load
+    stack instead of surfacing a normal Python exception.
+    """
+    if not data.id_to_label:
+        return
+
+    dimensionality = data.dimensionality
+    if dimensionality is None and _is_valid_dimensionality(expected_dimensionality):
+        dimensionality = expected_dimensionality
+        data.dimensionality = expected_dimensionality
+
+    if not _is_valid_dimensionality(dimensionality):
+        raise ValueError(
+            "Persisted local HNSW metadata has labels but no valid dimensionality"
+        )
+
+    if (
+        _is_valid_dimensionality(expected_dimensionality)
+        and dimensionality != expected_dimensionality
+    ):
+        raise ValueError(
+            "Persisted local HNSW metadata dimensionality does not match the "
+            "collection dimensionality"
+        )
+
+
 class PersistentData:
     """Stores the data and metadata needed for a PersistentLocalHnswSegment"""
 
@@ -69,10 +111,13 @@ class PersistentData:
         self.id_to_seq_id = id_to_seq_id
 
     @staticmethod
-    def load_from_file(filename: str) -> "PersistentData":
+    def load_from_file(
+        filename: str, expected_dimensionality: Optional[int] = None
+    ) -> "PersistentData":
         """Load persistent data from a file"""
         with open(filename, "rb") as f:
             ret = cast(PersistentData, pickle.load(f))
+            _validate_persisted_data(ret, expected_dimensionality)
             return ret
 
 
@@ -92,6 +137,7 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
     _allow_reset: bool
 
     _db: SqliteDB
+    _sysdb: SysDB
     _opentelemtry_client: OpenTelemetryClient
 
     _num_log_records_since_last_batch: int = 0
@@ -101,6 +147,7 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
         super().__init__(system, segment)
 
         self._db = system.instance(SqliteDB)
+        self._sysdb = system.instance(SysDB)
         self._opentelemtry_client = system.require(OpenTelemetryClient)
 
         self._params = PersistentHnswParams(segment["metadata"] or {})
@@ -115,7 +162,8 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
         # Load persist data if it exists already, otherwise create it
         if self._index_exists():
             self._persist_data = PersistentData.load_from_file(
-                self._get_metadata_file()
+                self._get_metadata_file(),
+                expected_dimensionality=self._get_collection_dimensionality(),
             )
             self._dimensionality = self._persist_data.dimensionality
             self._total_elements_added = self._persist_data.total_elements_added
@@ -188,6 +236,16 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
         """Get the storage folder path"""
         folder = os.path.join(self._persist_directory, str(self._id))
         return folder
+
+    def _get_collection_dimensionality(self) -> Optional[int]:
+        if self._collection is None:
+            return None
+
+        collections = self._sysdb.get_collections(id=self._collection)
+        if len(collections) == 0:
+            return None
+
+        return cast(Optional[int], collections[0]["dimension"])
 
     @trace_method(
         "PersistentLocalHnswSegment._init_index", OpenTelemetryGranularity.ALL
