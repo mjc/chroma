@@ -1179,6 +1179,33 @@ mod tests {
         label_to_id: HashMap<u32, String>,
     }
 
+    #[derive(Serialize)]
+    struct LegacyIdMapWithoutReverseLabels {
+        dimensionality: Option<usize>,
+        total_elements_added: u32,
+        max_seq_id: Option<u64>,
+        id_to_label: HashMap<String, u32>,
+        id_to_seq_id: HashMap<String, u32>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyIdMapWithoutTotalElementsAdded {
+        dimensionality: Option<usize>,
+        max_seq_id: Option<u64>,
+        id_to_label: HashMap<String, u32>,
+        label_to_id: HashMap<u32, String>,
+        id_to_seq_id: HashMap<String, u32>,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyIdMapWithoutForwardLabels {
+        dimensionality: Option<usize>,
+        total_elements_added: u32,
+        max_seq_id: Option<u64>,
+        label_to_id: HashMap<u32, String>,
+        id_to_seq_id: HashMap<String, u32>,
+    }
+
     #[test]
     fn persisted_id_map_defaults_missing_fields_before_validation() {
         let pickle = serde_pickle::to_vec(
@@ -1197,6 +1224,113 @@ mod tests {
 
         let err = validate_persisted_id_map(id_map, 3).unwrap_err();
         assert!(err.contains("partially populated"));
+    }
+
+    #[test]
+    fn persisted_id_map_defaults_missing_reverse_labels_before_validation() {
+        let pickle = serde_pickle::to_vec(
+            &LegacyIdMapWithoutReverseLabels {
+                dimensionality: Some(3),
+                total_elements_added: 1,
+                max_seq_id: None,
+                id_to_label: HashMap::from([(String::from("a"), 1)]),
+                id_to_seq_id: HashMap::from([(String::from("a"), 1)]),
+            },
+            SerOptions::new(),
+        )
+        .unwrap();
+        let id_map: IdMap =
+            serde_pickle::from_slice(&pickle, DeOptions::new()).expect("pickle should deserialize");
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("partially populated"));
+    }
+
+    #[test]
+    fn persisted_id_map_defaults_missing_total_before_validation() {
+        let pickle = serde_pickle::to_vec(
+            &LegacyIdMapWithoutTotalElementsAdded {
+                dimensionality: Some(3),
+                max_seq_id: None,
+                id_to_label: HashMap::from([(String::from("a"), 1)]),
+                label_to_id: HashMap::from([(1, String::from("a"))]),
+                id_to_seq_id: HashMap::from([(String::from("a"), 1)]),
+            },
+            SerOptions::new(),
+        )
+        .unwrap();
+        let id_map: IdMap =
+            serde_pickle::from_slice(&pickle, DeOptions::new()).expect("pickle should deserialize");
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("total_elements_added is smaller"));
+    }
+
+    #[test]
+    fn persisted_id_map_defaults_missing_forward_labels_before_validation() {
+        let pickle = serde_pickle::to_vec(
+            &LegacyIdMapWithoutForwardLabels {
+                dimensionality: Some(3),
+                total_elements_added: 1,
+                max_seq_id: None,
+                label_to_id: HashMap::from([(1, String::from("a"))]),
+                id_to_seq_id: HashMap::from([(String::from("a"), 1)]),
+            },
+            SerOptions::new(),
+        )
+        .unwrap();
+        let id_map: IdMap =
+            serde_pickle::from_slice(&pickle, DeOptions::new()).expect("pickle should deserialize");
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("partially populated"));
+    }
+
+    #[test]
+    fn persisted_id_map_accepts_empty_metadata_with_historical_total() {
+        let id_map = IdMap {
+            dimensionality: None,
+            total_elements_added: 4,
+            max_seq_id: None,
+            id_to_label: HashMap::new(),
+            label_to_id: HashMap::new(),
+            id_to_seq_id: HashMap::new(),
+        };
+
+        match validate_persisted_id_map(id_map, 3).unwrap() {
+            ValidatedIdMap::Uninitialized => {}
+            ValidatedIdMap::Initialized { .. } => panic!("id map should be uninitialized"),
+        }
+    }
+
+    #[test]
+    fn persisted_id_map_rejects_zero_labels() {
+        let id_map = IdMap {
+            dimensionality: Some(3),
+            total_elements_added: 1,
+            max_seq_id: None,
+            id_to_label: HashMap::from([(String::from("a"), 0)]),
+            label_to_id: HashMap::from([(0, String::from("a"))]),
+            id_to_seq_id: HashMap::from([(String::from("a"), 1)]),
+        };
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("labels must be positive"));
+    }
+
+    #[test]
+    fn persisted_id_map_rejects_extra_seq_id_entries() {
+        let id_map = IdMap {
+            dimensionality: Some(3),
+            total_elements_added: 1,
+            max_seq_id: None,
+            id_to_label: HashMap::from([(String::from("a"), 1)]),
+            label_to_id: HashMap::from([(1, String::from("a"))]),
+            id_to_seq_id: HashMap::from([(String::from("b"), 1)]),
+        };
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("seq id map does not match labels"));
     }
 
     #[test]
@@ -1321,6 +1455,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reader_reports_deserialize_error_for_truncated_pickle() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let index_folder = persist_root.path().join(segment.id.to_string());
+        fs::create_dir(&index_folder).expect("index folder should be created");
+        fs::write(index_folder.join(METADATA_FILE), [0x80, 0x03, b'}'])
+            .expect("metadata file should be written");
+        let sqlite = new_sqlite_db().await;
+
+        let result = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root.path().to_string_lossy().into_owned()),
+            sqlite,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(LocalHnswSegmentReaderError::PickleFileDeserializeError(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn writer_tracks_id_to_seq_id_across_mutations() {
         let (collection, segment) = test_collection_and_segment();
         let persist_root = tempdir().expect("persist root should be created");
@@ -1384,6 +1543,137 @@ mod tests {
         assert_eq!(
             guard.id_map.id_to_label.len(),
             guard.id_map.id_to_seq_id.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_reopens_index_persisted_by_writer() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let persist_root_str = persist_root.path().to_string_lossy().into_owned();
+        let sqlite = new_sqlite_db().await;
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer should initialize");
+        writer.index.inner.write().await.sync_threshold = 1;
+
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    1,
+                    Operation::Add,
+                    Some(vec![1.0, 2.0, 3.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("add should persist");
+
+        drop(writer);
+
+        let reader = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str),
+            sqlite,
+        )
+        .await
+        .expect("reader should reopen persisted index");
+
+        assert_eq!(
+            reader
+                .get_embedding_by_user_id(&String::from("a"))
+                .await
+                .expect("embedding should be readable after reopen"),
+            vec![1.0, 2.0, 3.0]
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_recovers_from_fully_deleted_persisted_metadata() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let persist_root_str = persist_root.path().to_string_lossy().into_owned();
+        let sqlite = new_sqlite_db().await;
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer should initialize");
+        writer.index.inner.write().await.sync_threshold = 1;
+
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    1,
+                    Operation::Add,
+                    Some(vec![1.0, 2.0, 3.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("add should persist");
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record("a", 2, Operation::Delete, None)].into(),
+            ))
+            .await
+            .expect("delete should persist");
+        drop(writer);
+
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer should reopen fully deleted metadata");
+        writer.index.inner.write().await.sync_threshold = 1;
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "replacement",
+                    3,
+                    Operation::Add,
+                    Some(vec![9.0, 8.0, 7.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("replacement add should persist");
+        drop(writer);
+
+        let reader = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str),
+            sqlite,
+        )
+        .await
+        .expect("reader should reopen replacement index");
+
+        assert_eq!(
+            reader
+                .get_embedding_by_user_id(&String::from("replacement"))
+                .await
+                .expect("replacement embedding should be readable after reopen"),
+            vec![9.0, 8.0, 7.0]
         );
     }
 }
