@@ -46,19 +46,81 @@ def test_validate_persisted_data_rejects_mismatched_expected_dimensionality():
         _validate_persisted_data(_persistent_data(5), expected_dimensionality=3)
 
 
-@pytest.mark.parametrize("dimensionality", [None, 0, -1])
-def test_validate_persisted_data_allows_empty_label_map_without_dimensionality(
-    dimensionality,
+@pytest.mark.parametrize("dimensionality,total_elements_added", [(None, 0), (0, 4), (-1, 9)])
+def test_validate_persisted_data_allows_empty_label_map_with_historical_total(
+    dimensionality, total_elements_added
 ):
     data = PersistentData(
         dimensionality=dimensionality,
-        total_elements_added=0,
+        total_elements_added=total_elements_added,
         id_to_label={},
         label_to_id={},
         id_to_seq_id={},
     )
 
     _validate_persisted_data(data)
+
+
+@pytest.mark.parametrize(
+    "label_to_id,id_to_seq_id",
+    [
+        ({1: "a"}, {}),
+        ({}, {"a": 1}),
+        ({1: "a"}, {"a": 1}),
+    ],
+)
+def test_validate_persisted_data_rejects_partially_populated_empty_metadata(
+    label_to_id, id_to_seq_id
+):
+    data = PersistentData(
+        dimensionality=None,
+        total_elements_added=3,
+        id_to_label={},
+        label_to_id=label_to_id,
+        id_to_seq_id=id_to_seq_id,
+    )
+
+    with pytest.raises(ValueError, match="partially populated"):
+        _validate_persisted_data(data)
+
+
+def test_validate_persisted_data_rejects_inconsistent_label_maps():
+    data = PersistentData(
+        dimensionality=3,
+        total_elements_added=2,
+        id_to_label={"a": 1},
+        label_to_id={2: "a"},
+        id_to_seq_id={"a": 1},
+    )
+
+    with pytest.raises(ValueError, match="label maps are inconsistent"):
+        _validate_persisted_data(data)
+
+
+def test_validate_persisted_data_rejects_missing_seq_id_entries():
+    data = PersistentData(
+        dimensionality=3,
+        total_elements_added=2,
+        id_to_label={"a": 1},
+        label_to_id={1: "a"},
+        id_to_seq_id={},
+    )
+
+    with pytest.raises(ValueError, match="seq id map does not match labels"):
+        _validate_persisted_data(data)
+
+
+def test_validate_persisted_data_rejects_total_smaller_than_max_label():
+    data = PersistentData(
+        dimensionality=3,
+        total_elements_added=1,
+        id_to_label={"a": 2},
+        label_to_id={2: "a"},
+        id_to_seq_id={"a": 1},
+    )
+
+    with pytest.raises(ValueError, match="total_elements_added is smaller"):
+        _validate_persisted_data(data)
 
 
 @pytest.mark.parametrize("dimensionality", [None, 0, -1, True, 1.5, "3"])
@@ -131,3 +193,22 @@ def test_load_from_file_rejects_mismatched_expected_dimensionality(tmp_path):
 
     with pytest.raises(ValueError, match="does not match the collection dimensionality"):
         PersistentData.load_from_file(str(path), expected_dimensionality=3)
+
+
+def test_load_from_file_rejects_inconsistent_metadata(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    with path.open("wb") as f:
+        pickle.dump(
+            PersistentData(
+                dimensionality=3,
+                total_elements_added=1,
+                id_to_label={"a": 1},
+                label_to_id={1: "b"},
+                id_to_seq_id={"a": 1},
+            ),
+            f,
+            pickle.HIGHEST_PROTOCOL,
+        )
+
+    with pytest.raises(ValueError, match="label maps are inconsistent"):
+        PersistentData.load_from_file(str(path))

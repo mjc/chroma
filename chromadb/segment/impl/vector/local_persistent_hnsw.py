@@ -70,6 +70,18 @@ def _is_valid_dimensionality(dimensionality: Optional[int]) -> bool:
     )
 
 
+def _is_valid_label(label: object) -> bool:
+    return not isinstance(label, bool) and isinstance(label, int) and label > 0
+
+
+def _is_valid_historical_total(total_elements_added: object) -> bool:
+    return (
+        not isinstance(total_elements_added, bool)
+        and isinstance(total_elements_added, int)
+        and total_elements_added >= 0
+    )
+
+
 def _validate_persisted_data(
     data: "PersistentData", expected_dimensionality: Optional[int] = None
 ) -> None:
@@ -81,7 +93,40 @@ def _validate_persisted_data(
     stack instead of surfacing a normal Python exception.
     """
     if not data.id_to_label:
+        if data.label_to_id or data.id_to_seq_id:
+            raise ValueError(
+                "Persisted local HNSW metadata is partially populated"
+            )
         return
+
+    if len(data.id_to_label) != len(data.label_to_id):
+        raise ValueError("Persisted local HNSW label maps are inconsistent")
+
+    if len(data.id_to_label) != len(data.id_to_seq_id):
+        raise ValueError("Persisted local HNSW seq id map does not match labels")
+
+    max_label = 0
+    for user_id, label in data.id_to_label.items():
+        if not _is_valid_label(label):
+            raise ValueError("Persisted local HNSW metadata has an invalid label")
+
+        if data.label_to_id.get(label) != user_id:
+            raise ValueError("Persisted local HNSW label maps are inconsistent")
+
+        if user_id not in data.id_to_seq_id:
+            raise ValueError("Persisted local HNSW seq id map does not match labels")
+
+        max_label = max(max_label, label)
+
+    if not _is_valid_historical_total(data.total_elements_added):
+        raise ValueError(
+            "Persisted local HNSW metadata has an invalid total_elements_added"
+        )
+
+    if data.total_elements_added < max_label:
+        raise ValueError(
+            "Persisted local HNSW total_elements_added is smaller than its labels"
+        )
 
     dimensionality = data.dimensionality
     if dimensionality is None and _is_valid_dimensionality(expected_dimensionality):
