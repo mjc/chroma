@@ -42,6 +42,26 @@ from chromadb.utils.read_write_lock import ReadRWLock, WriteRWLock
 logger = logging.getLogger(__name__)
 
 
+class SafeUnpickler(pickle.Unpickler):
+    """Restrict unpickling to the persisted HNSW metadata schema."""
+
+    ALLOWED_CLASSES = {
+        ("chromadb.segment.impl.vector.local_persistent_hnsw", "PersistentData"),
+        ("builtins", "bool"),
+        ("builtins", "bytes"),
+        ("builtins", "dict"),
+        ("builtins", "float"),
+        ("builtins", "int"),
+        ("builtins", "list"),
+        ("builtins", "str"),
+    }
+
+    def find_class(self, module: str, name: str) -> object:
+        if (module, name) not in self.ALLOWED_CLASSES:
+            raise pickle.UnpicklingError(f"Forbidden: {module}.{name}")
+        return super().find_class(module, name)
+
+
 def _is_valid_dimensionality(dimensionality: Optional[int]) -> bool:
     return (
         not isinstance(dimensionality, bool)
@@ -114,9 +134,9 @@ class PersistentData:
     def load_from_file(
         filename: str, expected_dimensionality: Optional[int] = None
     ) -> "PersistentData":
-        """Load persistent data from a file"""
+        """Load persistent data from a file using a restricted unpickler."""
         with open(filename, "rb") as f:
-            ret = cast(PersistentData, pickle.load(f))
+            ret = cast(PersistentData, SafeUnpickler(f).load())
             _validate_persisted_data(ret, expected_dimensionality)
             return ret
 
