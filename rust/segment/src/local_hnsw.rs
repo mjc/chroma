@@ -172,7 +172,7 @@ fn validate_persisted_id_map(
 async fn get_current_seq_id(
     segment: &Segment,
     sql_db: &SqliteDb,
-) -> Result<u64, sqlx::error::Error> {
+) -> Result<Option<u64>, sqlx::error::Error> {
     let (query, values) = Query::select()
         .column(MaxSeqId::SeqId)
         .from(MaxSeqId::Table)
@@ -181,11 +181,68 @@ async fn get_current_seq_id(
     let row = sqlx::query_with(&query, values)
         .fetch_optional(sql_db.get_conn())
         .await?;
-    let seq_id = row
-        .map(|row| row.try_get::<u64, _>(0))
-        .transpose()?
-        .unwrap_or_default();
-    Ok(seq_id)
+    row.map(|row| row.try_get::<u64, _>(0)).transpose()
+}
+
+async fn get_or_migrate_current_seq_id(
+    segment: &Segment,
+    sql_db: &SqliteDb,
+    legacy_max_seq_id: Option<u64>,
+) -> Result<Option<u64>, sqlx::error::Error> {
+    let current_seq_id = get_current_seq_id(segment, sql_db).await?;
+    if current_seq_id.is_some() {
+        return Ok(current_seq_id);
+    }
+
+    if let Some(max_seq_id) = legacy_max_seq_id {
+        let id = segment.id.to_string().into();
+        let max_id = max_seq_id.into();
+        let (query, values) = Query::insert()
+            .into_table(MaxSeqId::Table)
+            .columns([MaxSeqId::SegmentId, MaxSeqId::SeqId])
+            .values([id, max_id])
+            .expect("max_seq_id values should build")
+            .on_conflict(
+                OnConflict::column(MaxSeqId::SegmentId)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .build_sqlx(SqliteQueryBuilder);
+        let _ = sqlx::query_with(&query, values)
+            .execute(sql_db.get_conn())
+            .await?;
+        return Ok(Some(max_seq_id));
+    }
+
+    Ok(None)
+}
+
+fn validate_current_seq_id_state(current_seq_id: Option<u64>, id_map: &IdMap) -> Result<u64, String> {
+    let max_persisted_seq_id = id_map.id_to_seq_id.values().copied().max().map(u64::from);
+
+    match current_seq_id {
+        Some(current_seq_id) => {
+            if let Some(max_persisted_seq_id) = max_persisted_seq_id {
+                if current_seq_id < max_persisted_seq_id {
+                    return Err(
+                        "persisted SQLite max_seq_id is smaller than persisted seq ids"
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(current_seq_id)
+        }
+        None => {
+            if max_persisted_seq_id.is_some() {
+                Err(
+                    "persisted metadata has labels but SQLite max_seq_id is missing"
+                        .to_string(),
+                )
+            } else {
+                Ok(0)
+            }
+        }
+    }
 }
 
 impl LocalHnswSegmentReader {
@@ -247,7 +304,13 @@ impl LocalHnswSegmentReader {
                             )
                             .map_err(|_| LocalHnswSegmentReaderError::HnswIndexLoadError)?;
 
-                            let current_seq_id = get_current_seq_id(segment, &sql_db).await?;
+                            let current_seq_id =
+                                get_or_migrate_current_seq_id(segment, &sql_db, id_map.max_seq_id)
+                                    .await?;
+                            let current_seq_id =
+                                validate_current_seq_id_state(current_seq_id, &id_map).map_err(
+                                    LocalHnswSegmentReaderError::InvalidPersistedMetadata,
+                                )?;
 
                             // TODO(Sanket): Set allow reset appropriately.
                             return Ok(Self {
@@ -637,24 +700,6 @@ impl LocalHnswSegmentWriter {
                     } = validate_persisted_id_map(id_map, dimensionality)
                         .map_err(LocalHnswSegmentWriterError::InvalidPersistedMetadata)?
                     {
-                        // Migrate legacy max_seq_id if present
-                        if let Some(max_seq_id) = id_map.max_seq_id {
-                            let id = segment.id.to_string().into();
-                            let max_id = max_seq_id.into();
-                            let (query, values) = Query::insert()
-                                .into_table(MaxSeqId::Table)
-                                .columns([MaxSeqId::SegmentId, MaxSeqId::SeqId])
-                                .values([id, max_id])?
-                                .on_conflict(
-                                    OnConflict::column(MaxSeqId::SegmentId)
-                                        .do_nothing()
-                                        .to_owned(),
-                                )
-                                .build_sqlx(SqliteQueryBuilder);
-                            let _ = sqlx::query_with(&query, values)
-                                .execute(sql_db.get_conn())
-                                .await?;
-                        }
                         // Load hnsw index.
                         let index_config = IndexConfig::new(
                             persisted_dimensionality.get(),
@@ -668,7 +713,13 @@ impl LocalHnswSegmentWriter {
                         )
                         .map_err(|_| LocalHnswSegmentWriterError::HnswIndexLoadError)?;
 
-                        let current_seq_id = get_current_seq_id(segment, &sql_db).await?;
+                        let current_seq_id =
+                            get_or_migrate_current_seq_id(segment, &sql_db, id_map.max_seq_id)
+                                .await?;
+                        let current_seq_id =
+                            validate_current_seq_id_state(current_seq_id, &id_map).map_err(
+                                LocalHnswSegmentWriterError::InvalidPersistedMetadata,
+                            )?;
 
                         // TODO(Sanket): Set allow reset appropriately.
                         return Ok(Self {
@@ -1019,17 +1070,20 @@ async fn persist(
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_persisted_id_map, DeOptions, IdMap, LocalHnswSegmentReader,
+        validate_current_seq_id_state, validate_persisted_id_map, DeOptions, IdMap, LocalHnswSegmentReader,
         LocalHnswSegmentReaderError, LocalHnswSegmentWriter, LocalHnswSegmentWriterError,
         SerOptions, ValidatedIdMap, METADATA_FILE,
     };
     use chroma_config::{registry::Registry, Configurable};
     use chroma_sqlite::config::{MigrationHash, MigrationMode, SqliteDBConfig};
     use chroma_sqlite::db::SqliteDb;
+    use chroma_sqlite::table::MaxSeqId;
     use chroma_types::{
         test_segment, Chunk, Collection, KnnIndex, LogRecord, Operation, OperationRecord, Schema,
         Segment, SegmentScope,
     };
+    use sea_query::{Expr, Query, SqliteQueryBuilder};
+    use sea_query_binder::SqlxBinder;
     use serde::Serialize;
     use std::collections::HashMap;
     use std::fs;
@@ -1375,6 +1429,27 @@ mod tests {
     }
 
     #[test]
+    fn current_seq_id_state_rejects_missing_sqlite_state_for_populated_metadata() {
+        let err = validate_current_seq_id_state(None, &populated_id_map(Some(3))).unwrap_err();
+        assert!(err.contains("SQLite max_seq_id is missing"));
+    }
+
+    #[test]
+    fn current_seq_id_state_rejects_stale_sqlite_state_for_populated_metadata() {
+        let err =
+            validate_current_seq_id_state(Some(0), &populated_id_map(Some(3))).unwrap_err();
+        assert!(err.contains("SQLite max_seq_id is smaller"));
+    }
+
+    #[test]
+    fn current_seq_id_state_accepts_sqlite_state_covering_persisted_seq_ids() {
+        assert_eq!(
+            validate_current_seq_id_state(Some(3), &populated_id_map(Some(3))).unwrap(),
+            3
+        );
+    }
+
+    #[test]
     fn persistable_index_dimensionality_rejects_non_positive_values() {
         assert!(super::persistable_index_dimensionality(0).is_err());
         assert!(super::persistable_index_dimensionality(-1).is_err());
@@ -1441,6 +1516,30 @@ mod tests {
         SqliteDb::try_from_config(&config, &Registry::new())
             .await
             .expect("sqlite db should be created")
+    }
+
+    async fn set_current_seq_id(sqlite: &SqliteDb, segment: &Segment, seq_id: Option<u64>) {
+        let (delete_query, delete_values) = Query::delete()
+            .from_table(MaxSeqId::Table)
+            .and_where(Expr::col(MaxSeqId::SegmentId).eq(segment.id.to_string()))
+            .build_sqlx(SqliteQueryBuilder);
+        sqlx::query_with(&delete_query, delete_values)
+            .execute(sqlite.get_conn())
+            .await
+            .expect("max_seq_id row should be deleted");
+
+        if let Some(seq_id) = seq_id {
+            let (insert_query, insert_values) = Query::insert()
+                .into_table(MaxSeqId::Table)
+                .columns([MaxSeqId::SegmentId, MaxSeqId::SeqId])
+                .values([segment.id.to_string().into(), seq_id.into()])
+                .expect("max_seq_id values should build")
+                .build_sqlx(SqliteQueryBuilder);
+            sqlx::query_with(&insert_query, insert_values)
+                .execute(sqlite.get_conn())
+                .await
+                .expect("max_seq_id row should be inserted");
+        }
     }
 
     #[tokio::test]
@@ -1716,5 +1815,101 @@ mod tests {
                 .expect("replacement embedding should be readable after reopen"),
             vec![9.0, 8.0, 7.0]
         );
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_missing_sqlite_max_seq_id_for_persisted_metadata() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let persist_root_str = persist_root.path().to_string_lossy().into_owned();
+        let sqlite = new_sqlite_db().await;
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer should initialize");
+        writer.index.inner.write().await.sync_threshold = 1;
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    1,
+                    Operation::Add,
+                    Some(vec![1.0, 2.0, 3.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("add should persist");
+        drop(writer);
+
+        set_current_seq_id(&sqlite, &segment, None).await;
+
+        let result = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str),
+            sqlite,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(LocalHnswSegmentReaderError::InvalidPersistedMetadata(message))
+                if message.contains("SQLite max_seq_id is missing")
+        ));
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_stale_sqlite_max_seq_id_for_persisted_metadata() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let persist_root_str = persist_root.path().to_string_lossy().into_owned();
+        let sqlite = new_sqlite_db().await;
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer should initialize");
+        writer.index.inner.write().await.sync_threshold = 1;
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    3,
+                    Operation::Add,
+                    Some(vec![1.0, 2.0, 3.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("add should persist");
+        drop(writer);
+
+        set_current_seq_id(&sqlite, &segment, Some(0)).await;
+
+        let result = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str),
+            sqlite,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(LocalHnswSegmentReaderError::InvalidPersistedMetadata(message))
+                if message.contains("SQLite max_seq_id is smaller")
+        ));
     }
 }
