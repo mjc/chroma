@@ -455,6 +455,8 @@ pub enum LocalHnswSegmentWriterError {
     QueryBuilderError(#[from] sea_query::error::Error),
     #[error("Error updating max sequence id")]
     MaxSeqIdUpdateError(#[from] sqlx::error::Error),
+    #[error("Invalid persisted local HNSW metadata: {0}")]
+    InvalidPersistedMetadata(String),
 }
 
 impl ChromaError for LocalHnswSegmentWriterError {
@@ -476,6 +478,7 @@ impl ChromaError for LocalHnswSegmentWriterError {
             LocalHnswSegmentWriterError::PersistPathError => ErrorCodes::Internal,
             LocalHnswSegmentWriterError::QueryBuilderError(_) => ErrorCodes::Internal,
             LocalHnswSegmentWriterError::MaxSeqIdUpdateError(_) => ErrorCodes::Internal,
+            LocalHnswSegmentWriterError::InvalidPersistedMetadata(_) => ErrorCodes::Internal,
         }
     }
 }
@@ -839,17 +842,34 @@ impl LocalHnswSegmentWriter {
     }
 }
 
+fn persistable_index_dimensionality(
+    dimensionality: i32,
+) -> Result<usize, LocalHnswSegmentWriterError> {
+    if dimensionality <= 0 {
+        return Err(LocalHnswSegmentWriterError::InvalidPersistedMetadata(
+            format!("index dimensionality must be positive, got {dimensionality}"),
+        ));
+    }
+    usize::try_from(dimensionality).map_err(|_| {
+        LocalHnswSegmentWriterError::InvalidPersistedMetadata(format!(
+            "index dimensionality exceeds usize range: {dimensionality}"
+        ))
+    })
+}
+
 async fn persist(
-    guard: tokio::sync::RwLockWriteGuard<'_, Inner>,
+    mut guard: tokio::sync::RwLockWriteGuard<'_, Inner>,
 ) -> Result<tokio::sync::RwLockWriteGuard<'_, Inner>, LocalHnswSegmentWriterError> {
-    if let Some(path) = guard.persist_path.as_ref() {
+    if let Some(path) = guard.persist_path.clone() {
         // Persist hnsw index.
         guard
             .index
             .save()
             .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
         // Persist id map.
-        let metadata_file_path = Path::new(path).join(METADATA_FILE);
+        guard.id_map.dimensionality =
+            Some(persistable_index_dimensionality(guard.index.dimensionality())?);
+        let metadata_file_path = Path::new(&path).join(METADATA_FILE);
 
         let mut file = std::fs::File::create(metadata_file_path)?;
         // Using serde_pickle results in lots of small writes
@@ -858,4 +878,18 @@ async fn persist(
         buffered_file.flush()?;
     }
     Ok(guard)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn persistable_index_dimensionality_rejects_non_positive_values() {
+        assert!(super::persistable_index_dimensionality(0).is_err());
+        assert!(super::persistable_index_dimensionality(-1).is_err());
+    }
+
+    #[test]
+    fn persistable_index_dimensionality_accepts_positive_values() {
+        assert_eq!(super::persistable_index_dimensionality(384).unwrap(), 384);
+    }
 }
