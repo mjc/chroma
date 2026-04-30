@@ -91,13 +91,51 @@ fn validate_persisted_id_map(
     id_map: IdMap,
     expected_dimensionality: usize,
 ) -> Result<ValidatedIdMap, String> {
-    if id_map.id_to_label.is_empty() {
+    let live_maps_are_empty = id_map.id_to_label.is_empty()
+        && id_map.label_to_id.is_empty()
+        && id_map.id_to_seq_id.is_empty();
+    if live_maps_are_empty {
         return Ok(ValidatedIdMap::Uninitialized);
     }
 
-    let persisted_dimensionality = id_map
-        .dimensionality
-        .unwrap_or(expected_dimensionality);
+    if id_map.id_to_label.is_empty()
+        || id_map.label_to_id.is_empty()
+        || id_map.id_to_seq_id.is_empty()
+    {
+        return Err("segment has partially populated persisted metadata".to_string());
+    }
+
+    if id_map.id_to_label.len() != id_map.label_to_id.len() {
+        return Err("persisted label maps are inconsistent".to_string());
+    }
+
+    if id_map.id_to_label.len() != id_map.id_to_seq_id.len() {
+        return Err("persisted seq id map does not match labels".to_string());
+    }
+
+    let mut max_label = 0u32;
+    for (user_id, label) in &id_map.id_to_label {
+        if *label == 0 {
+            return Err("persisted labels must be positive".to_string());
+        }
+
+        match id_map.label_to_id.get(label) {
+            Some(reverse_user_id) if reverse_user_id == user_id => {}
+            _ => return Err("persisted label maps are inconsistent".to_string()),
+        }
+
+        if !id_map.id_to_seq_id.contains_key(user_id) {
+            return Err("persisted seq id map does not match labels".to_string());
+        }
+
+        max_label = max_label.max(*label);
+    }
+
+    if id_map.total_elements_added < max_label {
+        return Err("persisted total_elements_added is smaller than its labels".to_string());
+    }
+
+    let persisted_dimensionality = id_map.dimensionality.unwrap_or(expected_dimensionality);
 
     if persisted_dimensionality == 0 {
         return Err("segment has persisted labels but dimensionality is 0".to_string());
@@ -429,12 +467,16 @@ impl LocalHnswSegmentReader {
 #[derive(Deserialize, Serialize, Debug, Default)]
 struct IdMap {
     dimensionality: Option<usize>,
+    #[serde(default)]
     total_elements_added: u32,
     /// The max_seq_id field is deprecated in favor of the sqlite table
     #[serde(default)]
     max_seq_id: Option<u64>,
+    #[serde(default)]
     id_to_label: HashMap<String, u32>,
+    #[serde(default)]
     label_to_id: HashMap<u32, String>,
+    #[serde(default)]
     id_to_seq_id: HashMap<String, u32>,
 }
 
@@ -507,6 +549,8 @@ pub enum LocalHnswSegmentWriterError {
     HnswIndexDeleteError,
     #[error("Error converting persistant path to string")]
     PersistPathError,
+    #[error("Invalid log offset for persisted HNSW metadata: {0}")]
+    InvalidLogOffset(i64),
     #[error("Error updating max sequence id")]
     QueryBuilderError(#[from] sea_query::error::Error),
     #[error("Error updating max sequence id")]
@@ -532,6 +576,7 @@ impl ChromaError for LocalHnswSegmentWriterError {
             LocalHnswSegmentWriterError::HnswIndexResizeError => ErrorCodes::Internal,
             LocalHnswSegmentWriterError::HnswIndexDeleteError => ErrorCodes::Internal,
             LocalHnswSegmentWriterError::PersistPathError => ErrorCodes::Internal,
+            LocalHnswSegmentWriterError::InvalidLogOffset(_) => ErrorCodes::Internal,
             LocalHnswSegmentWriterError::QueryBuilderError(_) => ErrorCodes::Internal,
             LocalHnswSegmentWriterError::MaxSeqIdUpdateError(_) => ErrorCodes::Internal,
             LocalHnswSegmentWriterError::InvalidPersistedMetadata(_) => ErrorCodes::Internal,
@@ -739,6 +784,7 @@ impl LocalHnswSegmentWriter {
                     if !guard.id_map.id_to_label.contains_key(&log.record.id) {
                         match &log.record.embedding {
                             Some(_embedding) => {
+                                let persisted_seq_id = persistable_log_offset(log.log_offset)?;
                                 guard
                                     .id_map
                                     .id_to_label
@@ -747,6 +793,10 @@ impl LocalHnswSegmentWriter {
                                     .id_map
                                     .label_to_id
                                     .insert(next_label, log.record.id.clone());
+                                guard
+                                    .id_map
+                                    .id_to_seq_id
+                                    .insert(log.record.id.clone(), persisted_seq_id);
                                 let records_for_label = match hnsw_batch.get_mut(&next_label) {
                                     Some(records) => records,
                                     None => {
@@ -767,6 +817,11 @@ impl LocalHnswSegmentWriter {
                 Operation::Update => {
                     if let Some(label) = guard.id_map.id_to_label.get(&log.record.id).cloned() {
                         if let Some(_embedding) = &log.record.embedding {
+                            let persisted_seq_id = persistable_log_offset(log.log_offset)?;
+                            guard
+                                .id_map
+                                .id_to_seq_id
+                                .insert(log.record.id.clone(), persisted_seq_id);
                             let records_for_label = match hnsw_batch.get_mut(&label) {
                                 Some(records) => records,
                                 None => {
@@ -783,6 +838,7 @@ impl LocalHnswSegmentWriter {
                     if let Some(label) = guard.id_map.id_to_label.get(&log.record.id).cloned() {
                         guard.id_map.id_to_label.remove(&log.record.id);
                         guard.id_map.label_to_id.remove(&label);
+                        guard.id_map.id_to_seq_id.remove(&log.record.id);
                         let records_for_label = match hnsw_batch.get_mut(&label) {
                             Some(records) => records,
                             None => {
@@ -805,6 +861,7 @@ impl LocalHnswSegmentWriter {
                     };
                     match &log.record.embedding {
                         Some(_embedding) => {
+                            let persisted_seq_id = persistable_log_offset(log.log_offset)?;
                             guard
                                 .id_map
                                 .id_to_label
@@ -813,6 +870,10 @@ impl LocalHnswSegmentWriter {
                                 .id_map
                                 .label_to_id
                                 .insert(label, log.record.id.clone());
+                            guard
+                                .id_map
+                                .id_to_seq_id
+                                .insert(log.record.id.clone(), persisted_seq_id);
                             let records_for_label = match hnsw_batch.get_mut(&label) {
                                 Some(records) => records,
                                 None => {
@@ -918,6 +979,10 @@ fn persistable_index_dimensionality(
     })
 }
 
+fn persistable_log_offset(log_offset: i64) -> Result<u32, LocalHnswSegmentWriterError> {
+    u32::try_from(log_offset).map_err(|_| LocalHnswSegmentWriterError::InvalidLogOffset(log_offset))
+}
+
 async fn persist(
     mut guard: tokio::sync::RwLockWriteGuard<'_, Inner>,
 ) -> Result<tokio::sync::RwLockWriteGuard<'_, Inner>, LocalHnswSegmentWriterError> {
@@ -928,8 +993,9 @@ async fn persist(
             .save()
             .map_err(|_| LocalHnswSegmentWriterError::HnswIndexPersistError)?;
         // Persist id map.
-        guard.id_map.dimensionality =
-            Some(persistable_index_dimensionality(guard.index.dimensionality())?);
+        guard.id_map.dimensionality = Some(persistable_index_dimensionality(
+            guard.index.dimensionality(),
+        )?);
         let metadata_file_path = Path::new(&path).join(METADATA_FILE);
 
         let mut file = std::fs::File::create(metadata_file_path)?;
@@ -951,7 +1017,11 @@ mod tests {
     use chroma_config::{registry::Registry, Configurable};
     use chroma_sqlite::config::{MigrationHash, MigrationMode, SqliteDBConfig};
     use chroma_sqlite::db::SqliteDb;
-    use chroma_types::{test_segment, Collection, KnnIndex, Schema, Segment, SegmentScope};
+    use chroma_types::{
+        test_segment, Chunk, Collection, KnnIndex, LogRecord, Operation, OperationRecord, Schema,
+        Segment, SegmentScope,
+    };
+    use serde::Serialize;
     use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
@@ -1017,7 +1087,8 @@ mod tests {
 
     #[test]
     fn empty_persisted_id_map_can_stay_uninitialized() {
-        let id_map = IdMap::default();
+        let mut id_map = IdMap::default();
+        id_map.total_elements_added = 9;
 
         match validate_persisted_id_map(id_map, 3).unwrap() {
             ValidatedIdMap::Uninitialized => {}
@@ -1040,6 +1111,95 @@ mod tests {
     }
 
     #[test]
+    fn persisted_id_map_rejects_partially_populated_metadata() {
+        let id_map = IdMap {
+            dimensionality: None,
+            total_elements_added: 4,
+            max_seq_id: None,
+            id_to_label: HashMap::new(),
+            label_to_id: HashMap::from([(1, String::from("a"))]),
+            id_to_seq_id: HashMap::new(),
+        };
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("partially populated"));
+    }
+
+    #[test]
+    fn persisted_id_map_rejects_inconsistent_label_maps() {
+        let id_map = IdMap {
+            dimensionality: Some(3),
+            total_elements_added: 2,
+            max_seq_id: None,
+            id_to_label: HashMap::from([(String::from("a"), 1)]),
+            label_to_id: HashMap::from([(2, String::from("a"))]),
+            id_to_seq_id: HashMap::from([(String::from("a"), 1)]),
+        };
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("label maps are inconsistent"));
+    }
+
+    #[test]
+    fn persisted_id_map_rejects_missing_seq_id_entries() {
+        let id_map = IdMap {
+            dimensionality: Some(3),
+            total_elements_added: 2,
+            max_seq_id: None,
+            id_to_label: HashMap::from([(String::from("a"), 1), (String::from("b"), 2)]),
+            label_to_id: HashMap::from([(1, String::from("a")), (2, String::from("b"))]),
+            id_to_seq_id: HashMap::from([(String::from("a"), 1)]),
+        };
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("seq id map does not match labels"));
+    }
+
+    #[test]
+    fn persisted_id_map_rejects_total_smaller_than_max_label() {
+        let id_map = IdMap {
+            dimensionality: Some(3),
+            total_elements_added: 1,
+            max_seq_id: None,
+            id_to_label: HashMap::from([(String::from("a"), 2)]),
+            label_to_id: HashMap::from([(2, String::from("a"))]),
+            id_to_seq_id: HashMap::from([(String::from("a"), 1)]),
+        };
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("total_elements_added is smaller"));
+    }
+
+    #[derive(Serialize)]
+    struct LegacyIdMapWithoutSeqIds {
+        dimensionality: Option<usize>,
+        total_elements_added: u32,
+        max_seq_id: Option<u64>,
+        id_to_label: HashMap<String, u32>,
+        label_to_id: HashMap<u32, String>,
+    }
+
+    #[test]
+    fn persisted_id_map_defaults_missing_fields_before_validation() {
+        let pickle = serde_pickle::to_vec(
+            &LegacyIdMapWithoutSeqIds {
+                dimensionality: Some(3),
+                total_elements_added: 1,
+                max_seq_id: None,
+                id_to_label: HashMap::from([(String::from("a"), 1)]),
+                label_to_id: HashMap::from([(1, String::from("a"))]),
+            },
+            SerOptions::new(),
+        )
+        .unwrap();
+        let id_map: IdMap =
+            serde_pickle::from_slice(&pickle, DeOptions::new()).expect("pickle should deserialize");
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("partially populated"));
+    }
+
+    #[test]
     fn persistable_index_dimensionality_rejects_non_positive_values() {
         assert!(super::persistable_index_dimensionality(0).is_err());
         assert!(super::persistable_index_dimensionality(-1).is_err());
@@ -1048,6 +1208,33 @@ mod tests {
     #[test]
     fn persistable_index_dimensionality_accepts_positive_values() {
         assert_eq!(super::persistable_index_dimensionality(384).unwrap(), 384);
+    }
+
+    #[test]
+    fn persistable_log_offset_rejects_negative_values() {
+        assert!(matches!(
+            super::persistable_log_offset(-1),
+            Err(LocalHnswSegmentWriterError::InvalidLogOffset(-1))
+        ));
+    }
+
+    fn log_record(
+        id: &str,
+        log_offset: i64,
+        operation: Operation,
+        embedding: Option<Vec<f32>>,
+    ) -> LogRecord {
+        LogRecord {
+            log_offset,
+            record: OperationRecord {
+                id: id.to_string(),
+                embedding,
+                encoding: None,
+                metadata: None,
+                document: None,
+                operation,
+            },
+        }
     }
 
     fn test_collection_and_segment() -> (Collection, Segment) {
@@ -1069,9 +1256,7 @@ mod tests {
     }
 
     async fn new_sqlite_db() -> SqliteDb {
-        let db_dir = tempdir()
-            .expect("sqlite temp dir should be created")
-            .keep();
+        let db_dir = tempdir().expect("sqlite temp dir should be created").keep();
         let db_path = db_dir.join("chroma.sqlite3");
         let config = SqliteDBConfig {
             url: Some(db_path.to_string_lossy().into_owned()),
@@ -1133,5 +1318,72 @@ mod tests {
             LocalHnswSegmentWriterError::InvalidPersistedMetadata(message)
                 if message.contains("dimensionality is 0")
         ));
+    }
+
+    #[tokio::test]
+    async fn writer_tracks_id_to_seq_id_across_mutations() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let sqlite = new_sqlite_db().await;
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root.path().to_string_lossy().into_owned()),
+            sqlite,
+        )
+        .await
+        .expect("writer should initialize");
+
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    1,
+                    Operation::Add,
+                    Some(vec![1.0, 2.0, 3.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("add should succeed");
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    2,
+                    Operation::Update,
+                    Some(vec![3.0, 2.0, 1.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("update should succeed");
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "b",
+                    3,
+                    Operation::Upsert,
+                    Some(vec![4.0, 5.0, 6.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("upsert should succeed");
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record("a", 4, Operation::Delete, None)].into(),
+            ))
+            .await
+            .expect("delete should succeed");
+
+        let guard = writer.index.inner.read().await;
+        assert_eq!(guard.id_map.id_to_seq_id.get("b"), Some(&3));
+        assert!(!guard.id_map.id_to_seq_id.contains_key("a"));
+        assert_eq!(
+            guard.id_map.id_to_label.len(),
+            guard.id_map.id_to_seq_id.len()
+        );
     }
 }
