@@ -97,6 +97,20 @@ def test_validate_persisted_data_rejects_inconsistent_label_maps():
         _validate_persisted_data(data)
 
 
+@pytest.mark.parametrize("label", [0, -1, True, 1.5, "1"])
+def test_validate_persisted_data_rejects_invalid_labels(label):
+    data = PersistentData(
+        dimensionality=3,
+        total_elements_added=2,
+        id_to_label={"a": label},
+        label_to_id={1: "a"},
+        id_to_seq_id={"a": 1},
+    )
+
+    with pytest.raises(ValueError, match="invalid label"):
+        _validate_persisted_data(data)
+
+
 def test_validate_persisted_data_rejects_missing_seq_id_entries():
     data = PersistentData(
         dimensionality=3,
@@ -107,6 +121,20 @@ def test_validate_persisted_data_rejects_missing_seq_id_entries():
     )
 
     with pytest.raises(ValueError, match="seq id map does not match labels"):
+        _validate_persisted_data(data)
+
+
+@pytest.mark.parametrize("total_elements_added", [-1, True, 1.5, "1"])
+def test_validate_persisted_data_rejects_invalid_historical_total(total_elements_added):
+    data = PersistentData(
+        dimensionality=3,
+        total_elements_added=total_elements_added,
+        id_to_label={"a": 1},
+        label_to_id={1: "a"},
+        id_to_seq_id={"a": 1},
+    )
+
+    with pytest.raises(ValueError, match="invalid total_elements_added"):
         _validate_persisted_data(data)
 
 
@@ -211,4 +239,32 @@ def test_load_from_file_rejects_inconsistent_metadata(tmp_path):
         )
 
     with pytest.raises(ValueError, match="label maps are inconsistent"):
+        PersistentData.load_from_file(str(path))
+
+
+def test_load_from_file_rejects_invalid_total_elements_added(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    with path.open("wb") as f:
+        pickle.dump(
+            PersistentData(
+                dimensionality=3,
+                total_elements_added=-1,
+                id_to_label={"a": 1},
+                label_to_id={1: "a"},
+                id_to_seq_id={"a": 1},
+            ),
+            f,
+            pickle.HIGHEST_PROTOCOL,
+        )
+
+    with pytest.raises(ValueError, match="invalid total_elements_added"):
+        PersistentData.load_from_file(str(path))
+
+
+def test_load_from_file_rejects_truncated_pickle(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    payload = pickle.dumps(_persistent_data(3), pickle.HIGHEST_PROTOCOL)
+    path.write_bytes(payload[:-1])
+
+    with pytest.raises((pickle.UnpicklingError, EOFError)):
         PersistentData.load_from_file(str(path))
