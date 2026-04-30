@@ -111,6 +111,20 @@ def test_validate_persisted_data_rejects_invalid_labels(label):
         _validate_persisted_data(data)
 
 
+@pytest.mark.parametrize("seq_id", [-1, True, 1.5, "1"])
+def test_validate_persisted_data_rejects_invalid_seq_ids(seq_id):
+    data = PersistentData(
+        dimensionality=3,
+        total_elements_added=2,
+        id_to_label={"a": 1},
+        label_to_id={1: "a"},
+        id_to_seq_id={"a": seq_id},
+    )
+
+    with pytest.raises(ValueError, match="invalid seq id"):
+        _validate_persisted_data(data)
+
+
 def test_validate_persisted_data_rejects_missing_seq_id_entries():
     data = PersistentData(
         dimensionality=3,
@@ -121,6 +135,23 @@ def test_validate_persisted_data_rejects_missing_seq_id_entries():
     )
 
     with pytest.raises(ValueError, match="seq id map does not match labels"):
+        _validate_persisted_data(data)
+
+
+@pytest.mark.parametrize("max_seq_id", [-1, True, 1.5, "1"])
+def test_validate_persisted_data_rejects_invalid_legacy_max_seq_id(max_seq_id):
+    data = _persistent_data(3)
+    data.max_seq_id = max_seq_id
+
+    with pytest.raises(ValueError, match="invalid max_seq_id"):
+        _validate_persisted_data(data)
+
+
+def test_validate_persisted_data_rejects_legacy_max_seq_id_smaller_than_seq_ids():
+    data = _persistent_data(3)
+    data.max_seq_id = 0
+
+    with pytest.raises(ValueError, match="max_seq_id is smaller"):
         _validate_persisted_data(data)
 
 
@@ -258,6 +289,17 @@ def test_load_from_file_rejects_invalid_total_elements_added(tmp_path):
         )
 
     with pytest.raises(ValueError, match="invalid total_elements_added"):
+        PersistentData.load_from_file(str(path))
+
+
+def test_load_from_file_rejects_legacy_max_seq_id_smaller_than_seq_ids(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    data = _persistent_data(3)
+    data.max_seq_id = 0
+    with path.open("wb") as f:
+        pickle.dump(data, f, pickle.HIGHEST_PROTOCOL)
+
+    with pytest.raises(ValueError, match="max_seq_id is smaller"):
         PersistentData.load_from_file(str(path))
 
 

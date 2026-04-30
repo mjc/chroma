@@ -82,6 +82,10 @@ def _is_valid_historical_total(total_elements_added: object) -> bool:
     )
 
 
+def _is_valid_seq_id(seq_id: object) -> bool:
+    return not isinstance(seq_id, bool) and isinstance(seq_id, int) and seq_id >= 0
+
+
 def _validate_persisted_data(
     data: "PersistentData", expected_dimensionality: Optional[int] = None
 ) -> None:
@@ -92,6 +96,10 @@ def _validate_persisted_data(
     the value into hnswlib initialization, which can explode deeper in the load
     stack instead of surfacing a normal Python exception.
     """
+    legacy_max_seq_id = getattr(data, "max_seq_id", None)
+    if legacy_max_seq_id is not None and not _is_valid_seq_id(legacy_max_seq_id):
+        raise ValueError("Persisted local HNSW metadata has an invalid max_seq_id")
+
     if not data.id_to_label:
         if data.label_to_id or data.id_to_seq_id:
             raise ValueError(
@@ -113,8 +121,15 @@ def _validate_persisted_data(
         if data.label_to_id.get(label) != user_id:
             raise ValueError("Persisted local HNSW label maps are inconsistent")
 
-        if user_id not in data.id_to_seq_id:
+        seq_id = data.id_to_seq_id.get(user_id)
+        if seq_id is None:
             raise ValueError("Persisted local HNSW seq id map does not match labels")
+        if not _is_valid_seq_id(seq_id):
+            raise ValueError("Persisted local HNSW metadata has an invalid seq id")
+        if legacy_max_seq_id is not None and seq_id > legacy_max_seq_id:
+            raise ValueError(
+                "Persisted local HNSW max_seq_id is smaller than its seq ids"
+            )
 
         max_label = max(max_label, label)
 
@@ -268,23 +283,27 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
 
             if result:
                 self._max_seq_id = result[0]
-            elif self._index_exists():
-                # Migrate the max_seq_id from the legacy field in the pickled file to the SQLite database
-                q = (
-                    self._db.querybuilder()
-                    .into(Table("max_seq_id"))
-                    .columns("segment_id", "seq_id")
-                    .insert(
-                        ParameterValue(self._db.uuid_to_db(self._id)),
-                        ParameterValue(self._persist_data.max_seq_id),
-                    )
-                )
-                sql, params = get_sql(q)
-                cur.execute(sql, params)
-
-                self._max_seq_id = self._persist_data.max_seq_id
             else:
-                self._max_seq_id = self._consumer.min_seqid()
+                legacy_max_seq_id = cast(
+                    Optional[SeqId], getattr(self._persist_data, "max_seq_id", None)
+                )
+                if self._index_exists() and legacy_max_seq_id is not None:
+                    # Migrate the max_seq_id from the legacy field in the pickled file to the SQLite database
+                    q = (
+                        self._db.querybuilder()
+                        .into(Table("max_seq_id"))
+                        .columns("segment_id", "seq_id")
+                        .insert(
+                            ParameterValue(self._db.uuid_to_db(self._id)),
+                            ParameterValue(legacy_max_seq_id),
+                        )
+                    )
+                    sql, params = get_sql(q)
+                    cur.execute(sql, params)
+
+                    self._max_seq_id = legacy_max_seq_id
+                else:
+                    self._max_seq_id = self._consumer.min_seqid()
 
     @staticmethod
     @override
