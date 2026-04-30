@@ -86,6 +86,12 @@ def _is_valid_seq_id(seq_id: object) -> bool:
     return not isinstance(seq_id, bool) and isinstance(seq_id, int) and seq_id >= 0
 
 
+def _max_persisted_seq_id(data: "PersistentData") -> Optional[SeqId]:
+    if not data.id_to_seq_id:
+        return None
+    return max(data.id_to_seq_id.values())
+
+
 def _validate_persisted_data(
     data: "PersistentData", expected_dimensionality: Optional[int] = None
 ) -> None:
@@ -161,6 +167,35 @@ def _validate_persisted_data(
             "Persisted local HNSW metadata dimensionality does not match the "
             "collection dimensionality"
         )
+
+
+def _resolve_current_max_seq_id(
+    data: "PersistentData",
+    sqlite_max_seq_id: Optional[SeqId],
+    default_seq_id: SeqId,
+) -> SeqId:
+    max_persisted_seq_id = _max_persisted_seq_id(data)
+    if sqlite_max_seq_id is not None:
+        if (
+            max_persisted_seq_id is not None
+            and sqlite_max_seq_id < max_persisted_seq_id
+        ):
+            raise ValueError(
+                "Persisted local HNSW SQLite max_seq_id is smaller than its seq ids"
+            )
+        return sqlite_max_seq_id
+
+    legacy_max_seq_id = cast(Optional[SeqId], getattr(data, "max_seq_id", None))
+    if legacy_max_seq_id is not None:
+        return legacy_max_seq_id
+
+    if max_persisted_seq_id is not None:
+        raise ValueError(
+            "Persisted local HNSW metadata has labels but no max_seq_id state "
+            "in SQLite or legacy metadata"
+        )
+
+    return default_seq_id
 
 
 class PersistentData:
@@ -280,10 +315,14 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
             sql, params = get_sql(q)
             cur.execute(sql, params)
             result = cur.fetchone()
+            sqlite_max_seq_id = cast(Optional[SeqId], result[0] if result else None)
+            self._max_seq_id = _resolve_current_max_seq_id(
+                self._persist_data,
+                sqlite_max_seq_id,
+                self._consumer.min_seqid(),
+            )
 
-            if result:
-                self._max_seq_id = result[0]
-            else:
+            if not result:
                 legacy_max_seq_id = cast(
                     Optional[SeqId], getattr(self._persist_data, "max_seq_id", None)
                 )
@@ -300,10 +339,6 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
                     )
                     sql, params = get_sql(q)
                     cur.execute(sql, params)
-
-                    self._max_seq_id = legacy_max_seq_id
-                else:
-                    self._max_seq_id = self._consumer.min_seqid()
 
     @staticmethod
     @override

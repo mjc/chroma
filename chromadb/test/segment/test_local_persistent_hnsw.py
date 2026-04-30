@@ -4,6 +4,7 @@ import pytest
 
 from chromadb.segment.impl.vector.local_persistent_hnsw import (
     PersistentData,
+    _resolve_current_max_seq_id,
     _validate_persisted_data,
 )
 
@@ -153,6 +154,33 @@ def test_validate_persisted_data_rejects_legacy_max_seq_id_smaller_than_seq_ids(
 
     with pytest.raises(ValueError, match="max_seq_id is smaller"):
         _validate_persisted_data(data)
+
+
+def test_resolve_current_max_seq_id_uses_sqlite_state_when_present():
+    data = _persistent_data(3)
+
+    assert _resolve_current_max_seq_id(data, sqlite_max_seq_id=7, default_seq_id=-1) == 7
+
+
+def test_resolve_current_max_seq_id_rejects_stale_sqlite_state():
+    data = _persistent_data(3)
+
+    with pytest.raises(ValueError, match="SQLite max_seq_id is smaller"):
+        _resolve_current_max_seq_id(data, sqlite_max_seq_id=0, default_seq_id=-1)
+
+
+def test_resolve_current_max_seq_id_uses_legacy_state_when_sqlite_missing():
+    data = _persistent_data(3)
+    data.max_seq_id = 5
+
+    assert _resolve_current_max_seq_id(data, sqlite_max_seq_id=None, default_seq_id=-1) == 5
+
+
+def test_resolve_current_max_seq_id_rejects_populated_metadata_without_seq_id_state():
+    data = _persistent_data(3)
+
+    with pytest.raises(ValueError, match="no max_seq_id state"):
+        _resolve_current_max_seq_id(data, sqlite_max_seq_id=None, default_seq_id=-1)
 
 
 @pytest.mark.parametrize("total_elements_added", [-1, True, 1.5, "1"])

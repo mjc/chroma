@@ -11,6 +11,7 @@ import pytest
 
 from chromadb.api.client import Client
 from chromadb.config import Settings, System
+from chromadb.db.impl.sqlite import SqliteDB
 from chromadb.segment import VectorReader
 from chromadb.segment.impl.manager.local import LocalSegmentManager
 from chromadb.segment.impl.vector.local_persistent_hnsw import PersistentData
@@ -50,6 +51,12 @@ def _metadata_file(system: System, collection_id: object) -> Path:
     return Path(segment._get_metadata_file())  # type: ignore[attr-defined]
 
 
+def _vector_segment_id(system: System, collection_id: object) -> object:
+    manager = system.instance(LocalSegmentManager)
+    segment = manager.get_segment(collection_id, VectorReader)
+    return segment._id  # type: ignore[attr-defined]
+
+
 def _require_rust_bindings() -> None:
     pytest.importorskip("chromadb_rust_bindings")
 
@@ -79,6 +86,21 @@ def _assert_metadata_persisted(system: System, collection_id: object) -> Path:
     metadata_file = _metadata_file(system, collection_id)
     assert metadata_file.exists()
     return metadata_file
+
+
+def _set_sqlite_max_seq_id(
+    system: System, collection_id: object, seq_id: int | None
+) -> None:
+    sqlite = system.instance(SqliteDB)
+    segment_id = _vector_segment_id(system, collection_id)
+    db_segment_id = sqlite.uuid_to_db(segment_id)
+    with sqlite.tx() as cur:
+        cur.execute("DELETE FROM max_seq_id WHERE segment_id = ?", (db_segment_id,))
+        if seq_id is not None:
+            cur.execute(
+                "INSERT INTO max_seq_id(segment_id, seq_id) VALUES (?, ?)",
+                (db_segment_id, seq_id),
+            )
 
 
 def test_python_persisted_hnsw_round_trip_reopens_updated_vectors() -> None:
@@ -131,6 +153,81 @@ def test_python_persisted_hnsw_round_trip_recovers_fully_deleted_segment() -> No
             assert collection.get(ids=["gone"], include=["embeddings"])["ids"] == []
             collection.add(ids=["replacement"], embeddings=[[9.0, 9.0, 9.0]])
             _assert_single_embedding(collection, "replacement", [9.0, 9.0, 9.0])
+
+
+def test_python_reopen_rejects_missing_sqlite_max_seq_id_for_populated_metadata() -> None:
+    with TemporaryDirectory() as persist_directory:
+        with _persistent_system("chromadb.api.segment.SegmentAPI", persist_directory) as system:
+            client = Client.from_system(system)
+            collection = client.create_collection(
+                "python_missing_sqlite_seq_id",
+                metadata=PERSISTENT_HNSW_METADATA,
+            )
+            _persist_updated_vector(collection)
+            _assert_metadata_persisted(system, collection.id)
+            _set_sqlite_max_seq_id(system, collection.id, None)
+
+        with _persistent_system("chromadb.api.segment.SegmentAPI", persist_directory) as system:
+            client = Client.from_system(system)
+            collection = client.get_collection("python_missing_sqlite_seq_id")
+
+            with pytest.raises(ValueError, match="no max_seq_id state"):
+                collection.get(ids=["a"], include=["embeddings"])
+
+
+def test_python_reopen_rejects_stale_sqlite_max_seq_id_for_populated_metadata() -> None:
+    with TemporaryDirectory() as persist_directory:
+        with _persistent_system("chromadb.api.segment.SegmentAPI", persist_directory) as system:
+            client = Client.from_system(system)
+            collection = client.create_collection(
+                "python_stale_sqlite_seq_id",
+                metadata=PERSISTENT_HNSW_METADATA,
+            )
+            _persist_updated_vector(collection)
+            _assert_metadata_persisted(system, collection.id)
+            _set_sqlite_max_seq_id(system, collection.id, 0)
+
+        with _persistent_system("chromadb.api.segment.SegmentAPI", persist_directory) as system:
+            client = Client.from_system(system)
+            collection = client.get_collection("python_stale_sqlite_seq_id")
+
+            with pytest.raises(ValueError, match="SQLite max_seq_id is smaller"):
+                collection.get(ids=["a"], include=["embeddings"])
+
+
+def test_python_reopen_migrates_legacy_max_seq_id_when_sqlite_state_is_missing() -> None:
+    with TemporaryDirectory() as persist_directory:
+        with _persistent_system("chromadb.api.segment.SegmentAPI", persist_directory) as system:
+            client = Client.from_system(system)
+            collection = client.create_collection(
+                "python_legacy_sqlite_seq_id",
+                metadata=PERSISTENT_HNSW_METADATA,
+            )
+            _persist_updated_vector(collection)
+            metadata_file = _assert_metadata_persisted(system, collection.id)
+            _set_sqlite_max_seq_id(system, collection.id, None)
+
+            data = PersistentData.load_from_file(str(metadata_file))
+            data.max_seq_id = max(data.id_to_seq_id.values())
+            with metadata_file.open("wb") as f:
+                pickle.dump(data, f, pickle.HIGHEST_PROTOCOL)
+
+        with _persistent_system("chromadb.api.segment.SegmentAPI", persist_directory) as system:
+            client = Client.from_system(system)
+            collection = client.get_collection("python_legacy_sqlite_seq_id")
+
+            _assert_single_embedding(collection, "a", [3.0, 2.0, 1.0])
+
+            sqlite = system.instance(SqliteDB)
+            segment_id = sqlite.uuid_to_db(_vector_segment_id(system, collection.id))
+            with sqlite.tx() as cur:
+                cur.execute(
+                    "SELECT seq_id FROM max_seq_id WHERE segment_id = ?",
+                    (segment_id,),
+                )
+                row = cur.fetchone()
+            assert row is not None
+            assert row[0] == max(data.id_to_seq_id.values())
 
 
 def test_python_persisted_hnsw_written_data_reopens_in_rust_bindings() -> None:
