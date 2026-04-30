@@ -114,6 +114,7 @@ fn validate_persisted_id_map(
     }
 
     let mut max_label = 0u32;
+    let mut max_persisted_seq_id = 0u32;
     for (user_id, label) in &id_map.id_to_label {
         if *label == 0 {
             return Err("persisted labels must be positive".to_string());
@@ -124,15 +125,23 @@ fn validate_persisted_id_map(
             _ => return Err("persisted label maps are inconsistent".to_string()),
         }
 
-        if !id_map.id_to_seq_id.contains_key(user_id) {
-            return Err("persisted seq id map does not match labels".to_string());
-        }
+        let persisted_seq_id = match id_map.id_to_seq_id.get(user_id) {
+            Some(seq_id) => *seq_id,
+            None => return Err("persisted seq id map does not match labels".to_string()),
+        };
 
         max_label = max_label.max(*label);
+        max_persisted_seq_id = max_persisted_seq_id.max(persisted_seq_id);
     }
 
     if id_map.total_elements_added < max_label {
         return Err("persisted total_elements_added is smaller than its labels".to_string());
+    }
+
+    if let Some(max_seq_id) = id_map.max_seq_id {
+        if u64::from(max_persisted_seq_id) > max_seq_id {
+            return Err("persisted max_seq_id is smaller than its seq ids".to_string());
+        }
     }
 
     let persisted_dimensionality = id_map.dimensionality.unwrap_or(expected_dimensionality);
@@ -1331,6 +1340,38 @@ mod tests {
 
         let err = validate_persisted_id_map(id_map, 3).unwrap_err();
         assert!(err.contains("seq id map does not match labels"));
+    }
+
+    #[test]
+    fn persisted_id_map_accepts_max_seq_id_covering_seq_ids() {
+        let id_map = IdMap {
+            dimensionality: Some(3),
+            total_elements_added: 1,
+            max_seq_id: Some(5),
+            id_to_label: HashMap::from([(String::from("a"), 1)]),
+            label_to_id: HashMap::from([(1, String::from("a"))]),
+            id_to_seq_id: HashMap::from([(String::from("a"), 3)]),
+        };
+
+        match validate_persisted_id_map(id_map, 3).unwrap() {
+            ValidatedIdMap::Initialized { .. } => {}
+            ValidatedIdMap::Uninitialized => panic!("id map should be initialized"),
+        }
+    }
+
+    #[test]
+    fn persisted_id_map_rejects_max_seq_id_smaller_than_seq_ids() {
+        let id_map = IdMap {
+            dimensionality: Some(3),
+            total_elements_added: 1,
+            max_seq_id: Some(2),
+            id_to_label: HashMap::from([(String::from("a"), 1)]),
+            label_to_id: HashMap::from([(1, String::from("a"))]),
+            id_to_seq_id: HashMap::from([(String::from("a"), 3)]),
+        };
+
+        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
+        assert!(err.contains("max_seq_id is smaller"));
     }
 
     #[test]
