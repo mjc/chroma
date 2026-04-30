@@ -88,6 +88,13 @@ def _assert_metadata_persisted(system: System, collection_id: object) -> Path:
     return metadata_file
 
 
+def _break_hnsw_index_file(system: System, collection_id: object) -> None:
+    metadata_file = _metadata_file(system, collection_id)
+    index_files = [path for path in metadata_file.parent.iterdir() if path.name != metadata_file.name]
+    assert index_files
+    index_files[0].unlink()
+
+
 def _set_sqlite_max_seq_id(
     system: System, collection_id: object, seq_id: int | None
 ) -> None:
@@ -228,6 +235,26 @@ def test_python_reopen_migrates_legacy_max_seq_id_when_sqlite_state_is_missing()
                 row = cur.fetchone()
             assert row is not None
             assert row[0] == max(data.id_to_seq_id.values())
+
+
+def test_python_reopen_rejects_missing_hnsw_index_file() -> None:
+    with TemporaryDirectory() as persist_directory:
+        with _persistent_system("chromadb.api.segment.SegmentAPI", persist_directory) as system:
+            client = Client.from_system(system)
+            collection = client.create_collection(
+                "python_missing_hnsw_file",
+                metadata=PERSISTENT_HNSW_METADATA,
+            )
+            _persist_updated_vector(collection)
+            _assert_metadata_persisted(system, collection.id)
+            _break_hnsw_index_file(system, collection.id)
+
+        with _persistent_system("chromadb.api.segment.SegmentAPI", persist_directory) as system:
+            client = Client.from_system(system)
+            collection = client.get_collection("python_missing_hnsw_file")
+
+            with pytest.raises(RuntimeError):
+                collection.get(ids=["a"], include=["embeddings"])
 
 
 def test_python_persisted_hnsw_written_data_reopens_in_rust_bindings() -> None:

@@ -2,7 +2,7 @@ import os
 import shutil
 from overrides import override
 import pickle
-from typing import Dict, List, Optional, Sequence, Set, cast
+from typing import Dict, List, Mapping, Optional, Sequence, Set, cast
 from chromadb.config import System
 from chromadb.db.base import ParameterValue, get_sql
 from chromadb.db.impl.sqlite import SqliteDB
@@ -86,10 +86,35 @@ def _is_valid_seq_id(seq_id: object) -> bool:
     return not isinstance(seq_id, bool) and isinstance(seq_id, int) and seq_id >= 0
 
 
+def _require_attr(data: "PersistentData", attr: str) -> object:
+    if not hasattr(data, attr):
+        raise ValueError(f"Persisted local HNSW metadata is missing {attr}")
+    return getattr(data, attr)
+
+
+def _require_string_keyed_map(value: object, attr: str) -> Mapping[object, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Persisted local HNSW metadata has an invalid {attr}")
+    for key in value.keys():
+        if not isinstance(key, str):
+            raise ValueError(f"Persisted local HNSW metadata has an invalid {attr}")
+    return value
+
+
+def _require_label_to_id_map(value: object) -> Mapping[object, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Persisted local HNSW metadata has an invalid label_to_id")
+    for key, map_value in value.items():
+        if not _is_valid_label(key) or not isinstance(map_value, str):
+            raise ValueError("Persisted local HNSW metadata has an invalid label_to_id")
+    return value
+
+
 def _max_persisted_seq_id(data: "PersistentData") -> Optional[SeqId]:
-    if not data.id_to_seq_id:
+    id_to_seq_id = _require_string_keyed_map(_require_attr(data, "id_to_seq_id"), "id_to_seq_id")
+    if not id_to_seq_id:
         return None
-    return max(data.id_to_seq_id.values())
+    return max(cast(SeqId, seq_id) for seq_id in id_to_seq_id.values())
 
 
 def _validate_persisted_data(
@@ -106,28 +131,32 @@ def _validate_persisted_data(
     if legacy_max_seq_id is not None and not _is_valid_seq_id(legacy_max_seq_id):
         raise ValueError("Persisted local HNSW metadata has an invalid max_seq_id")
 
-    if not data.id_to_label:
-        if data.label_to_id or data.id_to_seq_id:
+    id_to_label = _require_string_keyed_map(_require_attr(data, "id_to_label"), "id_to_label")
+    label_to_id = _require_label_to_id_map(_require_attr(data, "label_to_id"))
+    id_to_seq_id = _require_string_keyed_map(_require_attr(data, "id_to_seq_id"), "id_to_seq_id")
+
+    if not id_to_label:
+        if label_to_id or id_to_seq_id:
             raise ValueError(
                 "Persisted local HNSW metadata is partially populated"
             )
         return
 
-    if len(data.id_to_label) != len(data.label_to_id):
+    if len(id_to_label) != len(label_to_id):
         raise ValueError("Persisted local HNSW label maps are inconsistent")
 
-    if len(data.id_to_label) != len(data.id_to_seq_id):
+    if len(id_to_label) != len(id_to_seq_id):
         raise ValueError("Persisted local HNSW seq id map does not match labels")
 
     max_label = 0
-    for user_id, label in data.id_to_label.items():
+    for user_id, label in id_to_label.items():
         if not _is_valid_label(label):
             raise ValueError("Persisted local HNSW metadata has an invalid label")
 
-        if data.label_to_id.get(label) != user_id:
+        if label_to_id.get(label) != user_id:
             raise ValueError("Persisted local HNSW label maps are inconsistent")
 
-        seq_id = data.id_to_seq_id.get(user_id)
+        seq_id = id_to_seq_id.get(user_id)
         if seq_id is None:
             raise ValueError("Persisted local HNSW seq id map does not match labels")
         if not _is_valid_seq_id(seq_id):
@@ -139,17 +168,18 @@ def _validate_persisted_data(
 
         max_label = max(max_label, label)
 
-    if not _is_valid_historical_total(data.total_elements_added):
+    total_elements_added = _require_attr(data, "total_elements_added")
+    if not _is_valid_historical_total(total_elements_added):
         raise ValueError(
             "Persisted local HNSW metadata has an invalid total_elements_added"
         )
 
-    if data.total_elements_added < max_label:
+    if total_elements_added < max_label:
         raise ValueError(
             "Persisted local HNSW total_elements_added is smaller than its labels"
         )
 
-    dimensionality = data.dimensionality
+    dimensionality = cast(Optional[int], getattr(data, "dimensionality", None))
     if dimensionality is None and _is_valid_dimensionality(expected_dimensionality):
         dimensionality = expected_dimensionality
         data.dimensionality = expected_dimensionality

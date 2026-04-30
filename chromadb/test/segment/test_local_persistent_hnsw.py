@@ -98,6 +98,41 @@ def test_validate_persisted_data_rejects_inconsistent_label_maps():
         _validate_persisted_data(data)
 
 
+@pytest.mark.parametrize(
+    "attr,value,match",
+    [
+        ("id_to_label", [], "invalid id_to_label"),
+        ("label_to_id", [], "invalid label_to_id"),
+        ("id_to_seq_id", [], "invalid id_to_seq_id"),
+    ],
+)
+def test_validate_persisted_data_rejects_non_mapping_fields(attr, value, match):
+    data = _persistent_data(3)
+    setattr(data, attr, value)
+
+    with pytest.raises(ValueError, match=match):
+        _validate_persisted_data(data)
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (lambda data: data.id_to_label.__setitem__(1, 1), "invalid id_to_label"),
+        (
+            lambda data: data.label_to_id.__setitem__(1, 2),
+            "invalid label_to_id",
+        ),
+        (lambda data: data.id_to_seq_id.__setitem__(1, 1), "invalid id_to_seq_id"),
+    ],
+)
+def test_validate_persisted_data_rejects_invalid_map_key_or_value_types(mutate, match):
+    data = _persistent_data(3)
+    mutate(data)
+
+    with pytest.raises(ValueError, match=match):
+        _validate_persisted_data(data)
+
+
 @pytest.mark.parametrize("label", [0, -1, True, 1.5, "1"])
 def test_validate_persisted_data_rejects_invalid_labels(label):
     data = PersistentData(
@@ -153,6 +188,15 @@ def test_validate_persisted_data_rejects_legacy_max_seq_id_smaller_than_seq_ids(
     data.max_seq_id = 0
 
     with pytest.raises(ValueError, match="max_seq_id is smaller"):
+        _validate_persisted_data(data)
+
+
+@pytest.mark.parametrize("attr", ["id_to_label", "label_to_id", "id_to_seq_id", "total_elements_added"])
+def test_validate_persisted_data_rejects_missing_required_attributes(attr):
+    data = _persistent_data(3)
+    delattr(data, attr)
+
+    with pytest.raises(ValueError, match=f"missing {attr}"):
         _validate_persisted_data(data)
 
 
@@ -298,6 +342,29 @@ def test_load_from_file_rejects_inconsistent_metadata(tmp_path):
         )
 
     with pytest.raises(ValueError, match="label maps are inconsistent"):
+        PersistentData.load_from_file(str(path))
+
+
+def test_load_from_file_uses_expected_dimensionality_when_attr_is_missing(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    data = _persistent_data(3)
+    delattr(data, "dimensionality")
+    with path.open("wb") as f:
+        pickle.dump(data, f, pickle.HIGHEST_PROTOCOL)
+
+    loaded = PersistentData.load_from_file(str(path), expected_dimensionality=7)
+    assert loaded.dimensionality == 7
+
+
+@pytest.mark.parametrize("attr", ["id_to_label", "label_to_id", "id_to_seq_id", "total_elements_added"])
+def test_load_from_file_rejects_missing_required_attributes(tmp_path, attr):
+    path = tmp_path / "index_metadata.pickle"
+    data = _persistent_data(3)
+    delattr(data, attr)
+    with path.open("wb") as f:
+        pickle.dump(data, f, pickle.HIGHEST_PROTOCOL)
+
+    with pytest.raises(ValueError, match=f"missing {attr}"):
         PersistentData.load_from_file(str(path))
 
 
