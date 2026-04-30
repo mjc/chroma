@@ -181,7 +181,11 @@ class PersistentData:
     ) -> "PersistentData":
         """Load persistent data from a file using a restricted unpickler."""
         with open(filename, "rb") as f:
-            ret = cast(PersistentData, SafeUnpickler(f).load())
+            ret = SafeUnpickler(f).load()
+            if not isinstance(ret, PersistentData):
+                raise pickle.UnpicklingError(
+                    "Persisted local HNSW metadata did not deserialize to PersistentData"
+                )
             _validate_persisted_data(ret, expected_dimensionality)
             return ret
 

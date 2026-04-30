@@ -80,3 +80,14 @@ def test_load_from_file_blocks_malicious_pickle(tmp_path):
 
     with pytest.raises(pickle.UnpicklingError, match="Forbidden"):
         PersistentData.load_from_file(str(path))
+
+
+def test_load_from_file_rejects_unexpected_root_object(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    with path.open("wb") as f:
+        pickle.dump({"dimensionality": 3}, f, pickle.HIGHEST_PROTOCOL)
+
+    with pytest.raises(
+        pickle.UnpicklingError, match="did not deserialize to PersistentData"
+    ):
+        PersistentData.load_from_file(str(path))
