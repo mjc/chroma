@@ -1542,6 +1542,20 @@ mod tests {
         }
     }
 
+    fn remove_one_index_file(persist_root: &tempfile::TempDir, segment: &Segment) {
+        let index_folder = persist_root.path().join(segment.id.to_string());
+        let mut removed = false;
+        for entry in fs::read_dir(index_folder).expect("index folder should be readable") {
+            let entry = entry.expect("directory entry should be readable");
+            if entry.file_name() != METADATA_FILE {
+                fs::remove_file(entry.path()).expect("index file should be removable");
+                removed = true;
+                break;
+            }
+        }
+        assert!(removed, "an hnsw index file should have been removed");
+    }
+
     #[tokio::test]
     async fn reader_rejects_invalid_persisted_metadata_before_loading_hnsw_index() {
         let (collection, segment) = test_collection_and_segment();
@@ -1910,6 +1924,114 @@ mod tests {
             result,
             Err(LocalHnswSegmentReaderError::InvalidPersistedMetadata(message))
                 if message.contains("SQLite max_seq_id is smaller")
+        ));
+    }
+
+    #[tokio::test]
+    async fn reader_reopens_with_migrated_legacy_max_seq_id() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let persist_root_str = persist_root.path().to_string_lossy().into_owned();
+        let sqlite = new_sqlite_db().await;
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer should initialize");
+        writer.index.inner.write().await.sync_threshold = 1;
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    3,
+                    Operation::Add,
+                    Some(vec![1.0, 2.0, 3.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("add should persist");
+        drop(writer);
+
+        let index_folder = persist_root.path().join(segment.id.to_string());
+        let metadata_file = index_folder.join(METADATA_FILE);
+        let file = fs::File::open(&metadata_file).expect("metadata file should open");
+        let mut id_map: IdMap =
+            serde_pickle::from_reader(file, DeOptions::new()).expect("id map should deserialize");
+        id_map.max_seq_id = Some(3);
+        let mut rewritten = fs::File::create(&metadata_file).expect("metadata file should rewrite");
+        serde_pickle::to_writer(&mut rewritten, &id_map, SerOptions::new())
+            .expect("id map should serialize");
+
+        set_current_seq_id(&sqlite, &segment, None).await;
+
+        let reader = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str),
+            sqlite.clone(),
+        )
+        .await
+        .expect("reader should reopen with migrated legacy max_seq_id");
+
+        assert_eq!(
+            reader
+                .current_max_seq_id(&segment.id)
+                .await
+                .expect("current max seq id should be readable"),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_missing_hnsw_index_file() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let persist_root_str = persist_root.path().to_string_lossy().into_owned();
+        let sqlite = new_sqlite_db().await;
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer should initialize");
+        writer.index.inner.write().await.sync_threshold = 1;
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    1,
+                    Operation::Add,
+                    Some(vec![1.0, 2.0, 3.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("add should persist");
+        drop(writer);
+
+        remove_one_index_file(&persist_root, &segment);
+
+        let result = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str),
+            sqlite,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(LocalHnswSegmentReaderError::HnswIndexLoadError)
         ));
     }
 }
