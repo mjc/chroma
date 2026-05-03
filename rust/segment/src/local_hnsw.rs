@@ -597,8 +597,10 @@ pub enum LocalHnswSegmentWriterError {
     HnswConfigError(#[from] Box<chroma_index::HnswIndexConfigError>),
     #[error("Error opening pickle file")]
     PickleFileOpenError(#[from] std::io::Error),
+    #[error("Error serializing pickle file")]
+    PickleFileSerializeError(#[from] serde_pickle::Error),
     #[error("Error deserializing pickle file")]
-    PickleFileDeserializeError(#[from] serde_pickle::Error),
+    PickleFileDeserializeError(serde_pickle::Error),
     #[error("Error loading hnsw index")]
     HnswIndexLoadError,
     #[error("Nothing found on disk")]
@@ -636,6 +638,7 @@ impl ChromaError for LocalHnswSegmentWriterError {
         match self {
             LocalHnswSegmentWriterError::HnswConfigError(e) => e.code(),
             LocalHnswSegmentWriterError::PickleFileOpenError(_) => ErrorCodes::Internal,
+            LocalHnswSegmentWriterError::PickleFileSerializeError(_) => ErrorCodes::Internal,
             LocalHnswSegmentWriterError::PickleFileDeserializeError(_) => ErrorCodes::Internal,
             LocalHnswSegmentWriterError::HnswIndexLoadError => ErrorCodes::Internal,
             LocalHnswSegmentWriterError::UninitializedSegment => ErrorCodes::Internal,
@@ -654,6 +657,34 @@ impl ChromaError for LocalHnswSegmentWriterError {
             LocalHnswSegmentWriterError::InvalidPersistedMetadata(_) => ErrorCodes::Internal,
         }
     }
+}
+
+fn write_file_atomically<E, F>(path: &Path, write: F) -> Result<(), E>
+where
+    E: From<std::io::Error>,
+    F: FnOnce(&mut std::io::BufWriter<&mut std::fs::File>) -> Result<(), E>,
+{
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic write path is missing a parent directory",
+        )
+    })?;
+    let mut temp_file = tempfile::Builder::new()
+        .prefix(".index_metadata.")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    {
+        let mut buffered_file = std::io::BufWriter::new(temp_file.as_file_mut());
+        write(&mut buffered_file)?;
+        buffered_file.flush()?;
+    }
+    temp_file.as_file().sync_all()?;
+    temp_file
+        .into_temp_path()
+        .persist(path)
+        .map_err(|err| E::from(err.error))?;
+    Ok(())
 }
 
 impl LocalHnswSegmentWriter {
@@ -1058,11 +1089,10 @@ async fn persist(
         )?);
         let metadata_file_path = Path::new(&path).join(METADATA_FILE);
 
-        let mut file = std::fs::File::create(metadata_file_path)?;
-        // Using serde_pickle results in lots of small writes
-        let mut buffered_file = std::io::BufWriter::new(&mut file);
-        serde_pickle::to_writer(&mut buffered_file, &guard.id_map, SerOptions::new())?;
-        buffered_file.flush()?;
+        write_file_atomically::<LocalHnswSegmentWriterError, _>(&metadata_file_path, |buffered_file| {
+            serde_pickle::to_writer(buffered_file, &guard.id_map, SerOptions::new())?;
+            Ok(())
+        })?;
     }
     Ok(guard)
 }
@@ -1070,7 +1100,7 @@ async fn persist(
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_current_seq_id_state, validate_persisted_id_map, DeOptions, IdMap, LocalHnswSegmentReader,
+        validate_current_seq_id_state, validate_persisted_id_map, write_file_atomically, DeOptions, IdMap, LocalHnswSegmentReader,
         LocalHnswSegmentReaderError, LocalHnswSegmentWriter, LocalHnswSegmentWriterError,
         SerOptions, ValidatedIdMap, METADATA_FILE,
     };
@@ -1087,6 +1117,7 @@ mod tests {
     use serde::Serialize;
     use std::collections::HashMap;
     use std::fs;
+    use std::io::{self, Write};
     use tempfile::tempdir;
 
     fn populated_id_map(dimensionality: Option<usize>) -> IdMap {
@@ -1556,6 +1587,39 @@ mod tests {
         assert!(removed, "an hnsw index file should have been removed");
     }
 
+    fn corrupt_one_index_file(persist_root: &tempfile::TempDir, segment: &Segment) {
+        let index_folder = persist_root.path().join(segment.id.to_string());
+        let mut corrupted = false;
+        for entry in fs::read_dir(index_folder).expect("index folder should be readable") {
+            let entry = entry.expect("directory entry should be readable");
+            if entry.file_name() != METADATA_FILE {
+                fs::write(entry.path(), b"corrupt hnsw index")
+                    .expect("index file should be writable");
+                corrupted = true;
+                break;
+            }
+        }
+        assert!(corrupted, "an hnsw index file should have been corrupted");
+    }
+
+    #[test]
+    fn atomic_metadata_write_preserves_existing_file_on_failure() {
+        let temp_dir = tempdir().expect("temp dir should be created");
+        let metadata_file = temp_dir.path().join(METADATA_FILE);
+        fs::write(&metadata_file, b"stable metadata").expect("metadata file should be written");
+
+        let result = write_file_atomically::<io::Error, _>(&metadata_file, |buffered_file| {
+            buffered_file.write_all(b"corrupt metadata")?;
+            Err(io::Error::other("broken atomic write"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&metadata_file).expect("metadata file should still be readable"),
+            b"stable metadata"
+        );
+    }
+
     #[tokio::test]
     async fn reader_rejects_invalid_persisted_metadata_before_loading_hnsw_index() {
         let (collection, segment) = test_collection_and_segment();
@@ -2019,6 +2083,53 @@ mod tests {
         drop(writer);
 
         remove_one_index_file(&persist_root, &segment);
+
+        let result = LocalHnswSegmentReader::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str),
+            sqlite,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(LocalHnswSegmentReaderError::HnswIndexLoadError)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reader_rejects_corrupt_hnsw_index_file() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let persist_root_str = persist_root.path().to_string_lossy().into_owned();
+        let sqlite = new_sqlite_db().await;
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer should initialize");
+        writer.index.inner.write().await.sync_threshold = 1;
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    1,
+                    Operation::Add,
+                    Some(vec![1.0, 2.0, 3.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("add should persist");
+        drop(writer);
+
+        corrupt_one_index_file(&persist_root, &segment);
 
         let result = LocalHnswSegmentReader::from_segment(
             &collection,

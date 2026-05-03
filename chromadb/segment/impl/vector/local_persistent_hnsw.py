@@ -2,6 +2,7 @@ import os
 import shutil
 from overrides import override
 import pickle
+from tempfile import NamedTemporaryFile
 from typing import Dict, List, Mapping, Optional, Sequence, Set, cast
 from chromadb.config import System
 from chromadb.db.base import ParameterValue, get_sql
@@ -226,6 +227,31 @@ def _resolve_current_max_seq_id(
         )
 
     return default_seq_id
+
+
+def _atomic_pickle_dump(filename: str, value: object) -> None:
+    directory = os.path.dirname(filename) or "."
+    temp_filename: Optional[str] = None
+    try:
+        with NamedTemporaryFile(
+            mode="wb",
+            dir=directory,
+            prefix=".index_metadata.",
+            suffix=".tmp",
+            delete=False,
+        ) as metadata_file:
+            temp_filename = metadata_file.name
+            pickle.dump(value, metadata_file, pickle.HIGHEST_PROTOCOL)
+            metadata_file.flush()
+            os.fsync(metadata_file.fileno())
+        os.replace(temp_filename, filename)
+    except Exception:
+        if temp_filename is not None:
+            try:
+                os.unlink(temp_filename)
+            except FileNotFoundError:
+                pass
+        raise
 
 
 class PersistentData:
@@ -463,8 +489,7 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
         self._persist_data.label_to_id = self._label_to_id
         self._persist_data.id_to_seq_id = self._id_to_seq_id
 
-        with open(self._get_metadata_file(), "wb") as metadata_file:
-            pickle.dump(self._persist_data, metadata_file, pickle.HIGHEST_PROTOCOL)
+        _atomic_pickle_dump(self._get_metadata_file(), self._persist_data)
 
         with self._db.tx() as cur:
             q = (
