@@ -286,6 +286,25 @@ def test_load_from_file_allows_empty_label_map_without_dimensionality(tmp_path):
     assert loaded.id_to_label == {}
 
 
+def test_load_from_file_rejects_invalid_total_elements_added_with_empty_maps(tmp_path):
+    path = tmp_path / "index_metadata.pickle"
+    with path.open("wb") as f:
+        pickle.dump(
+            PersistentData(
+                dimensionality=None,
+                total_elements_added=-1,
+                id_to_label={},
+                label_to_id={},
+                id_to_seq_id={},
+            ),
+            f,
+            pickle.HIGHEST_PROTOCOL,
+        )
+
+    with pytest.raises(ValueError, match="invalid total_elements_added"):
+        PersistentData.load_from_file(str(path))
+
+
 def test_load_from_file_allows_valid_dimensionality_when_labels_exist(tmp_path):
     path = tmp_path / "index_metadata.pickle"
     with path.open("wb") as f:

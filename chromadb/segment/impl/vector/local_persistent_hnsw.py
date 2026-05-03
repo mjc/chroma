@@ -136,6 +136,12 @@ def _validate_persisted_data(
     label_to_id = _require_label_to_id_map(_require_attr(data, "label_to_id"))
     id_to_seq_id = _require_string_keyed_map(_require_attr(data, "id_to_seq_id"), "id_to_seq_id")
 
+    total_elements_added = _require_attr(data, "total_elements_added")
+    if not _is_valid_historical_total(total_elements_added):
+        raise ValueError(
+            "Persisted local HNSW metadata has an invalid total_elements_added"
+        )
+
     if not id_to_label:
         if label_to_id or id_to_seq_id:
             raise ValueError(
@@ -168,12 +174,6 @@ def _validate_persisted_data(
             )
 
         max_label = max(max_label, label)
-
-    total_elements_added = _require_attr(data, "total_elements_added")
-    if not _is_valid_historical_total(total_elements_added):
-        raise ValueError(
-            "Persisted local HNSW metadata has an invalid total_elements_added"
-        )
 
     if total_elements_added < max_label:
         raise ValueError(

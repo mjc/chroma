@@ -98,10 +98,7 @@ fn validate_persisted_id_map(
         return Ok(ValidatedIdMap::Uninitialized);
     }
 
-    if id_map.id_to_label.is_empty()
-        || id_map.label_to_id.is_empty()
-        || id_map.id_to_seq_id.is_empty()
-    {
+    if id_map.id_to_label.is_empty() || id_map.label_to_id.is_empty() {
         return Err("segment has partially populated persisted metadata".to_string());
     }
 
@@ -109,12 +106,13 @@ fn validate_persisted_id_map(
         return Err("persisted label maps are inconsistent".to_string());
     }
 
-    if id_map.id_to_label.len() != id_map.id_to_seq_id.len() {
+    let has_legacy_missing_seq_ids = id_map.id_to_seq_id.is_empty();
+    if !has_legacy_missing_seq_ids && id_map.id_to_label.len() != id_map.id_to_seq_id.len() {
         return Err("persisted seq id map does not match labels".to_string());
     }
 
     let mut max_label = 0u32;
-    let mut max_persisted_seq_id = 0u32;
+    let mut max_persisted_seq_id = 0u64;
     for (user_id, label) in &id_map.id_to_label {
         if *label == 0 {
             return Err("persisted labels must be positive".to_string());
@@ -125,13 +123,15 @@ fn validate_persisted_id_map(
             _ => return Err("persisted label maps are inconsistent".to_string()),
         }
 
-        let persisted_seq_id = match id_map.id_to_seq_id.get(user_id) {
-            Some(seq_id) => *seq_id,
-            None => return Err("persisted seq id map does not match labels".to_string()),
-        };
+        if !has_legacy_missing_seq_ids {
+            let persisted_seq_id = match id_map.id_to_seq_id.get(user_id) {
+                Some(seq_id) => *seq_id,
+                None => return Err("persisted seq id map does not match labels".to_string()),
+            };
+            max_persisted_seq_id = max_persisted_seq_id.max(persisted_seq_id);
+        }
 
         max_label = max_label.max(*label);
-        max_persisted_seq_id = max_persisted_seq_id.max(persisted_seq_id);
     }
 
     if id_map.total_elements_added < max_label {
@@ -139,7 +139,7 @@ fn validate_persisted_id_map(
     }
 
     if let Some(max_seq_id) = id_map.max_seq_id {
-        if u64::from(max_persisted_seq_id) > max_seq_id {
+        if max_persisted_seq_id > max_seq_id {
             return Err("persisted max_seq_id is smaller than its seq ids".to_string());
         }
     }
@@ -217,16 +217,18 @@ async fn get_or_migrate_current_seq_id(
     Ok(None)
 }
 
-fn validate_current_seq_id_state(current_seq_id: Option<u64>, id_map: &IdMap) -> Result<u64, String> {
-    let max_persisted_seq_id = id_map.id_to_seq_id.values().copied().max().map(u64::from);
+fn validate_current_seq_id_state(
+    current_seq_id: Option<u64>,
+    id_map: &IdMap,
+) -> Result<u64, String> {
+    let max_persisted_seq_id = id_map.id_to_seq_id.values().copied().max();
 
     match current_seq_id {
         Some(current_seq_id) => {
             if let Some(max_persisted_seq_id) = max_persisted_seq_id {
                 if current_seq_id < max_persisted_seq_id {
                     return Err(
-                        "persisted SQLite max_seq_id is smaller than persisted seq ids"
-                            .to_string(),
+                        "persisted SQLite max_seq_id is smaller than persisted seq ids".to_string(),
                     );
                 }
             }
@@ -234,14 +236,21 @@ fn validate_current_seq_id_state(current_seq_id: Option<u64>, id_map: &IdMap) ->
         }
         None => {
             if max_persisted_seq_id.is_some() {
-                Err(
-                    "persisted metadata has labels but SQLite max_seq_id is missing"
-                        .to_string(),
-                )
+                Err("persisted metadata has labels but SQLite max_seq_id is missing".to_string())
             } else {
                 Ok(0)
             }
         }
+    }
+}
+
+fn hydrate_legacy_id_to_seq_id(id_map: &mut IdMap, current_seq_id: u64) {
+    if id_map.id_to_label.is_empty() || !id_map.id_to_seq_id.is_empty() {
+        return;
+    }
+
+    for user_id in id_map.id_to_label.keys() {
+        id_map.id_to_seq_id.insert(user_id.clone(), current_seq_id);
     }
 }
 
@@ -311,6 +320,8 @@ impl LocalHnswSegmentReader {
                                 validate_current_seq_id_state(current_seq_id, &id_map).map_err(
                                     LocalHnswSegmentReaderError::InvalidPersistedMetadata,
                                 )?;
+                            let mut id_map = id_map;
+                            hydrate_legacy_id_to_seq_id(&mut id_map, current_seq_id);
 
                             // TODO(Sanket): Set allow reset appropriately.
                             return Ok(Self {
@@ -549,7 +560,7 @@ struct IdMap {
     #[serde(default)]
     label_to_id: HashMap<u32, String>,
     #[serde(default)]
-    id_to_seq_id: HashMap<String, u32>,
+    id_to_seq_id: HashMap<String, u64>,
 }
 
 #[allow(dead_code)]
@@ -747,10 +758,10 @@ impl LocalHnswSegmentWriter {
                         let current_seq_id =
                             get_or_migrate_current_seq_id(segment, &sql_db, id_map.max_seq_id)
                                 .await?;
-                        let current_seq_id =
-                            validate_current_seq_id_state(current_seq_id, &id_map).map_err(
-                                LocalHnswSegmentWriterError::InvalidPersistedMetadata,
-                            )?;
+                        let current_seq_id = validate_current_seq_id_state(current_seq_id, &id_map)
+                            .map_err(LocalHnswSegmentWriterError::InvalidPersistedMetadata)?;
+                        let mut id_map = id_map;
+                        hydrate_legacy_id_to_seq_id(&mut id_map, current_seq_id);
 
                         // TODO(Sanket): Set allow reset appropriately.
                         return Ok(Self {
@@ -1070,8 +1081,8 @@ fn persistable_index_dimensionality(
     })
 }
 
-fn persistable_log_offset(log_offset: i64) -> Result<u32, LocalHnswSegmentWriterError> {
-    u32::try_from(log_offset).map_err(|_| LocalHnswSegmentWriterError::InvalidLogOffset(log_offset))
+fn persistable_log_offset(log_offset: i64) -> Result<u64, LocalHnswSegmentWriterError> {
+    u64::try_from(log_offset).map_err(|_| LocalHnswSegmentWriterError::InvalidLogOffset(log_offset))
 }
 
 async fn persist(
@@ -1089,10 +1100,13 @@ async fn persist(
         )?);
         let metadata_file_path = Path::new(&path).join(METADATA_FILE);
 
-        write_file_atomically::<LocalHnswSegmentWriterError, _>(&metadata_file_path, |buffered_file| {
-            serde_pickle::to_writer(buffered_file, &guard.id_map, SerOptions::new())?;
-            Ok(())
-        })?;
+        write_file_atomically::<LocalHnswSegmentWriterError, _>(
+            &metadata_file_path,
+            |buffered_file| {
+                serde_pickle::to_writer(buffered_file, &guard.id_map, SerOptions::new())?;
+                Ok(())
+            },
+        )?;
     }
     Ok(guard)
 }
@@ -1100,9 +1114,9 @@ async fn persist(
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_current_seq_id_state, validate_persisted_id_map, write_file_atomically, DeOptions, IdMap, LocalHnswSegmentReader,
-        LocalHnswSegmentReaderError, LocalHnswSegmentWriter, LocalHnswSegmentWriterError,
-        SerOptions, ValidatedIdMap, METADATA_FILE,
+        validate_current_seq_id_state, validate_persisted_id_map, write_file_atomically, DeOptions,
+        IdMap, LocalHnswSegmentReader, LocalHnswSegmentReaderError, LocalHnswSegmentWriter,
+        LocalHnswSegmentWriterError, SerOptions, ValidatedIdMap, METADATA_FILE,
     };
     use chroma_config::{registry::Registry, Configurable};
     use chroma_sqlite::config::{MigrationHash, MigrationMode, SqliteDBConfig};
@@ -1250,6 +1264,40 @@ mod tests {
     }
 
     #[test]
+    fn persisted_id_map_accepts_legacy_empty_seq_id_map() {
+        let id_map = IdMap {
+            dimensionality: Some(3),
+            total_elements_added: 1,
+            max_seq_id: None,
+            id_to_label: HashMap::from([(String::from("a"), 1)]),
+            label_to_id: HashMap::from([(1, String::from("a"))]),
+            id_to_seq_id: HashMap::new(),
+        };
+
+        assert!(matches!(
+            validate_persisted_id_map(id_map, 3).unwrap(),
+            ValidatedIdMap::Initialized { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_empty_seq_id_map_is_hydrated_from_current_seq_id() {
+        let mut id_map = IdMap {
+            dimensionality: Some(3),
+            total_elements_added: 1,
+            max_seq_id: None,
+            id_to_label: HashMap::from([(String::from("a"), 1)]),
+            label_to_id: HashMap::from([(1, String::from("a"))]),
+            id_to_seq_id: HashMap::new(),
+        };
+        let seq_id = u64::from(u32::MAX) + 1;
+
+        hydrate_legacy_id_to_seq_id(&mut id_map, seq_id);
+
+        assert_eq!(id_map.id_to_seq_id.get("a"), Some(&seq_id));
+    }
+
+    #[test]
     fn persisted_id_map_rejects_total_smaller_than_max_label() {
         let id_map = IdMap {
             dimensionality: Some(3),
@@ -1279,7 +1327,7 @@ mod tests {
         total_elements_added: u32,
         max_seq_id: Option<u64>,
         id_to_label: HashMap<String, u32>,
-        id_to_seq_id: HashMap<String, u32>,
+        id_to_seq_id: HashMap<String, u64>,
     }
 
     #[derive(Serialize)]
@@ -1288,7 +1336,7 @@ mod tests {
         max_seq_id: Option<u64>,
         id_to_label: HashMap<String, u32>,
         label_to_id: HashMap<u32, String>,
-        id_to_seq_id: HashMap<String, u32>,
+        id_to_seq_id: HashMap<String, u64>,
     }
 
     #[derive(Serialize)]
@@ -1297,7 +1345,7 @@ mod tests {
         total_elements_added: u32,
         max_seq_id: Option<u64>,
         label_to_id: HashMap<u32, String>,
-        id_to_seq_id: HashMap<String, u32>,
+        id_to_seq_id: HashMap<String, u64>,
     }
 
     #[test]
@@ -1467,8 +1515,7 @@ mod tests {
 
     #[test]
     fn current_seq_id_state_rejects_stale_sqlite_state_for_populated_metadata() {
-        let err =
-            validate_current_seq_id_state(Some(0), &populated_id_map(Some(3))).unwrap_err();
+        let err = validate_current_seq_id_state(Some(0), &populated_id_map(Some(3))).unwrap_err();
         assert!(err.contains("SQLite max_seq_id is smaller"));
     }
 
@@ -1497,6 +1544,16 @@ mod tests {
             super::persistable_log_offset(-1),
             Err(LocalHnswSegmentWriterError::InvalidLogOffset(-1))
         ));
+    }
+
+    #[test]
+    fn persistable_log_offset_accepts_values_larger_than_u32() {
+        let log_offset = i64::from(u32::MAX) + 1;
+
+        assert_eq!(
+            super::persistable_log_offset(log_offset).unwrap(),
+            log_offset as u64
+        );
     }
 
     fn log_record(
