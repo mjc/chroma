@@ -104,7 +104,8 @@ def _corrupt_hnsw_index_file(system: System, collection_id: object) -> None:
     metadata_file = _metadata_file(system, collection_id)
     index_files = [path for path in metadata_file.parent.iterdir() if path.name != metadata_file.name]
     assert index_files
-    index_files[0].write_bytes(b"corrupt hnsw index")
+    for index_file in index_files:
+        index_file.write_bytes(b"corrupt hnsw index")
 
 
 def _set_sqlite_max_seq_id(
@@ -279,6 +280,14 @@ def test_python_reopen_migrates_legacy_max_seq_id_when_sqlite_state_is_missing()
                 row = cur.fetchone()
             assert row is not None
             assert row[0] == max(data.id_to_seq_id.values())
+
+            collection.upsert(ids=["a"], embeddings=[[4.0, 3.0, 2.0]])
+            collection.upsert(ids=["a"], embeddings=[[5.0, 4.0, 3.0]])
+            collection.upsert(ids=["a"], embeddings=[[6.0, 5.0, 4.0]])
+            migrated_data = PersistentData.load_from_file(
+                str(_assert_metadata_persisted(system, collection.id))
+            )
+            assert getattr(migrated_data, "max_seq_id", None) is None
 
 
 def test_python_reopen_rejects_missing_hnsw_index_file() -> None:

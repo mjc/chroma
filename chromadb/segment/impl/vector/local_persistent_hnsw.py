@@ -168,11 +168,6 @@ def _validate_persisted_data(
             raise ValueError("Persisted local HNSW seq id map does not match labels")
         if not _is_valid_seq_id(seq_id):
             raise ValueError("Persisted local HNSW metadata has an invalid seq id")
-        if legacy_max_seq_id is not None and seq_id > legacy_max_seq_id:
-            raise ValueError(
-                "Persisted local HNSW max_seq_id is smaller than its seq ids"
-            )
-
         max_label = max(max_label, label)
 
     if total_elements_added < max_label:
@@ -218,6 +213,13 @@ def _resolve_current_max_seq_id(
 
     legacy_max_seq_id = cast(Optional[SeqId], getattr(data, "max_seq_id", None))
     if legacy_max_seq_id is not None:
+        if (
+            max_persisted_seq_id is not None
+            and legacy_max_seq_id < max_persisted_seq_id
+        ):
+            raise ValueError(
+                "Persisted local HNSW max_seq_id is smaller than its seq ids"
+            )
         return legacy_max_seq_id
 
     if max_persisted_seq_id is not None:
@@ -395,6 +397,7 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
                     )
                     sql, params = get_sql(q)
                     cur.execute(sql, params)
+                    self._persist_data.max_seq_id = None
 
     @staticmethod
     @override
@@ -488,6 +491,7 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
         self._persist_data.id_to_label = self._id_to_label
         self._persist_data.label_to_id = self._label_to_id
         self._persist_data.id_to_seq_id = self._id_to_seq_id
+        self._persist_data.max_seq_id = None
 
         _atomic_pickle_dump(self._get_metadata_file(), self._persist_data)
 

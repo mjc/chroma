@@ -183,12 +183,11 @@ def test_validate_persisted_data_rejects_invalid_legacy_max_seq_id(max_seq_id):
         _validate_persisted_data(data)
 
 
-def test_validate_persisted_data_rejects_legacy_max_seq_id_smaller_than_seq_ids():
+def test_validate_persisted_data_allows_stale_legacy_max_seq_id():
     data = _persistent_data(3)
     data.max_seq_id = 0
 
-    with pytest.raises(ValueError, match="max_seq_id is smaller"):
-        _validate_persisted_data(data)
+    _validate_persisted_data(data)
 
 
 @pytest.mark.parametrize("attr", ["id_to_label", "label_to_id", "id_to_seq_id", "total_elements_added"])
@@ -202,6 +201,7 @@ def test_validate_persisted_data_rejects_missing_required_attributes(attr):
 
 def test_resolve_current_max_seq_id_uses_sqlite_state_when_present():
     data = _persistent_data(3)
+    data.max_seq_id = 0
 
     assert _resolve_current_max_seq_id(data, sqlite_max_seq_id=7, default_seq_id=-1) == 7
 
@@ -218,6 +218,14 @@ def test_resolve_current_max_seq_id_uses_legacy_state_when_sqlite_missing():
     data.max_seq_id = 5
 
     assert _resolve_current_max_seq_id(data, sqlite_max_seq_id=None, default_seq_id=-1) == 5
+
+
+def test_resolve_current_max_seq_id_rejects_stale_legacy_state_when_sqlite_missing():
+    data = _persistent_data(3)
+    data.max_seq_id = 0
+
+    with pytest.raises(ValueError, match="max_seq_id is smaller"):
+        _resolve_current_max_seq_id(data, sqlite_max_seq_id=None, default_seq_id=-1)
 
 
 def test_resolve_current_max_seq_id_rejects_populated_metadata_without_seq_id_state():
@@ -406,15 +414,16 @@ def test_load_from_file_rejects_invalid_total_elements_added(tmp_path):
         PersistentData.load_from_file(str(path))
 
 
-def test_load_from_file_rejects_legacy_max_seq_id_smaller_than_seq_ids(tmp_path):
+def test_load_from_file_allows_stale_legacy_max_seq_id(tmp_path):
     path = tmp_path / "index_metadata.pickle"
     data = _persistent_data(3)
     data.max_seq_id = 0
     with path.open("wb") as f:
         pickle.dump(data, f, pickle.HIGHEST_PROTOCOL)
 
-    with pytest.raises(ValueError, match="max_seq_id is smaller"):
-        PersistentData.load_from_file(str(path))
+    loaded = PersistentData.load_from_file(str(path))
+
+    assert loaded.max_seq_id == 0
 
 
 def test_load_from_file_rejects_truncated_pickle(tmp_path):

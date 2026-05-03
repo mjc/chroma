@@ -138,12 +138,6 @@ fn validate_persisted_id_map(
         return Err("persisted total_elements_added is smaller than its labels".to_string());
     }
 
-    if let Some(max_seq_id) = id_map.max_seq_id {
-        if max_persisted_seq_id > max_seq_id {
-            return Err("persisted max_seq_id is smaller than its seq ids".to_string());
-        }
-    }
-
     let persisted_dimensionality = id_map.dimensionality.unwrap_or(expected_dimensionality);
 
     if persisted_dimensionality == 0 {
@@ -735,7 +729,8 @@ impl LocalHnswSegmentWriter {
                         .await?
                         .into_std()
                         .await;
-                    let id_map: IdMap = serde_pickle::from_reader(file, DeOptions::new())?;
+                    let id_map: IdMap = serde_pickle::from_reader(file, DeOptions::new())
+                        .map_err(LocalHnswSegmentWriterError::PickleFileDeserializeError)?;
                     if let ValidatedIdMap::Initialized {
                         id_map,
                         dimensionality: persisted_dimensionality,
@@ -1098,6 +1093,7 @@ async fn persist(
         guard.id_map.dimensionality = Some(persistable_index_dimensionality(
             guard.index.dimensionality(),
         )?);
+        guard.id_map.max_seq_id = None;
         let metadata_file_path = Path::new(&path).join(METADATA_FILE);
 
         write_file_atomically::<LocalHnswSegmentWriterError, _>(
@@ -1493,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_id_map_rejects_max_seq_id_smaller_than_seq_ids() {
+    fn persisted_id_map_allows_stale_legacy_max_seq_id() {
         let id_map = IdMap {
             dimensionality: Some(3),
             total_elements_added: 1,
@@ -1503,8 +1499,10 @@ mod tests {
             id_to_seq_id: HashMap::from([(String::from("a"), 3)]),
         };
 
-        let err = validate_persisted_id_map(id_map, 3).unwrap_err();
-        assert!(err.contains("max_seq_id is smaller"));
+        match validate_persisted_id_map(id_map, 3).unwrap() {
+            ValidatedIdMap::Initialized { .. } => {}
+            ValidatedIdMap::Uninitialized => panic!("id map should be initialized"),
+        }
     }
 
     #[test]
@@ -1653,10 +1651,9 @@ mod tests {
                 fs::write(entry.path(), b"corrupt hnsw index")
                     .expect("index file should be writable");
                 corrupted = true;
-                break;
             }
         }
-        assert!(corrupted, "an hnsw index file should have been corrupted");
+        assert!(corrupted, "hnsw index files should have been corrupted");
     }
 
     #[test]
@@ -1751,6 +1748,31 @@ mod tests {
         assert!(matches!(
             result,
             Err(LocalHnswSegmentReaderError::PickleFileDeserializeError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn writer_reports_deserialize_error_for_truncated_pickle() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let index_folder = persist_root.path().join(segment.id.to_string());
+        fs::create_dir(&index_folder).expect("index folder should be created");
+        fs::write(index_folder.join(METADATA_FILE), [0x80, 0x03, b'}'])
+            .expect("metadata file should be written");
+        let sqlite = new_sqlite_db().await;
+
+        let result = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root.path().to_string_lossy().into_owned()),
+            sqlite,
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(LocalHnswSegmentWriterError::PickleFileDeserializeError(_))
         ));
     }
 
@@ -2107,6 +2129,78 @@ mod tests {
                 .expect("current max seq id should be readable"),
             3
         );
+    }
+
+    #[tokio::test]
+    async fn writer_clears_legacy_max_seq_id_after_migration() {
+        let (collection, segment) = test_collection_and_segment();
+        let persist_root = tempdir().expect("persist root should be created");
+        let persist_root_str = persist_root.path().to_string_lossy().into_owned();
+        let sqlite = new_sqlite_db().await;
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer should initialize");
+        writer.index.inner.write().await.sync_threshold = 1;
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    3,
+                    Operation::Add,
+                    Some(vec![1.0, 2.0, 3.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("add should persist");
+        drop(writer);
+
+        let index_folder = persist_root.path().join(segment.id.to_string());
+        let metadata_file = index_folder.join(METADATA_FILE);
+        let file = fs::File::open(&metadata_file).expect("metadata file should open");
+        let mut id_map: IdMap =
+            serde_pickle::from_reader(file, DeOptions::new()).expect("id map should deserialize");
+        id_map.max_seq_id = Some(3);
+        let mut rewritten = fs::File::create(&metadata_file).expect("metadata file should rewrite");
+        serde_pickle::to_writer(&mut rewritten, &id_map, SerOptions::new())
+            .expect("id map should serialize");
+        set_current_seq_id(&sqlite, &segment, None).await;
+
+        let mut writer = LocalHnswSegmentWriter::from_segment(
+            &collection,
+            &segment,
+            3,
+            Some(persist_root_str.clone()),
+            sqlite.clone(),
+        )
+        .await
+        .expect("writer should reopen with migrated legacy max_seq_id");
+        writer.index.inner.write().await.sync_threshold = 1;
+        writer
+            .apply_log_chunk(Chunk::new(
+                vec![log_record(
+                    "a",
+                    4,
+                    Operation::Update,
+                    Some(vec![3.0, 2.0, 1.0]),
+                )]
+                .into(),
+            ))
+            .await
+            .expect("update should persist");
+        drop(writer);
+
+        let file = fs::File::open(&metadata_file).expect("metadata file should open");
+        let id_map: IdMap =
+            serde_pickle::from_reader(file, DeOptions::new()).expect("id map should deserialize");
+        assert_eq!(id_map.max_seq_id, None);
+        assert_eq!(id_map.id_to_seq_id.get("a"), Some(&4));
     }
 
     #[tokio::test]
