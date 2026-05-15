@@ -2,10 +2,12 @@ import os
 import shutil
 from overrides import override
 import pickle
-from typing import Dict, List, Optional, Sequence, Set, cast
+from tempfile import NamedTemporaryFile
+from typing import Dict, List, Mapping, Optional, Sequence, Set, cast
 from chromadb.config import System
 from chromadb.db.base import ParameterValue, get_sql
 from chromadb.db.impl.sqlite import SqliteDB
+from chromadb.db.system import SysDB
 from chromadb.segment.impl.vector.batch import Batch
 from chromadb.segment.impl.vector.hnsw_params import PersistentHnswParams
 from chromadb.segment.impl.vector.local_hnsw import (
@@ -41,6 +43,219 @@ from chromadb.utils.read_write_lock import ReadRWLock, WriteRWLock
 logger = logging.getLogger(__name__)
 
 
+class SafeUnpickler(pickle.Unpickler):
+    """Restrict unpickling to the persisted HNSW metadata schema."""
+
+    ALLOWED_CLASSES = {
+        ("chromadb.segment.impl.vector.local_persistent_hnsw", "PersistentData"),
+        ("builtins", "bool"),
+        ("builtins", "bytes"),
+        ("builtins", "dict"),
+        ("builtins", "float"),
+        ("builtins", "int"),
+        ("builtins", "list"),
+        ("builtins", "str"),
+    }
+
+    def find_class(self, module: str, name: str) -> object:
+        if (module, name) not in self.ALLOWED_CLASSES:
+            raise pickle.UnpicklingError(f"Forbidden: {module}.{name}")
+        return super().find_class(module, name)
+
+
+def _is_valid_dimensionality(dimensionality: Optional[int]) -> bool:
+    return (
+        not isinstance(dimensionality, bool)
+        and isinstance(dimensionality, int)
+        and dimensionality > 0
+    )
+
+
+def _is_valid_label(label: object) -> bool:
+    return not isinstance(label, bool) and isinstance(label, int) and label > 0
+
+
+def _is_valid_historical_total(total_elements_added: object) -> bool:
+    return (
+        not isinstance(total_elements_added, bool)
+        and isinstance(total_elements_added, int)
+        and total_elements_added >= 0
+    )
+
+
+def _is_valid_seq_id(seq_id: object) -> bool:
+    return not isinstance(seq_id, bool) and isinstance(seq_id, int) and seq_id >= 0
+
+
+def _require_attr(data: "PersistentData", attr: str) -> object:
+    if not hasattr(data, attr):
+        raise ValueError(f"Persisted local HNSW metadata is missing {attr}")
+    return getattr(data, attr)
+
+
+def _require_string_keyed_map(value: object, attr: str) -> Mapping[object, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Persisted local HNSW metadata has an invalid {attr}")
+    for key in value.keys():
+        if not isinstance(key, str):
+            raise ValueError(f"Persisted local HNSW metadata has an invalid {attr}")
+    return value
+
+
+def _require_label_to_id_map(value: object) -> Mapping[object, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Persisted local HNSW metadata has an invalid label_to_id")
+    for key, map_value in value.items():
+        if not _is_valid_label(key) or not isinstance(map_value, str):
+            raise ValueError("Persisted local HNSW metadata has an invalid label_to_id")
+    return value
+
+
+def _max_persisted_seq_id(data: "PersistentData") -> Optional[SeqId]:
+    id_to_seq_id = _require_string_keyed_map(_require_attr(data, "id_to_seq_id"), "id_to_seq_id")
+    if not id_to_seq_id:
+        return None
+    return max(cast(SeqId, seq_id) for seq_id in id_to_seq_id.values())
+
+
+def _validate_persisted_data(
+    data: "PersistentData", expected_dimensionality: Optional[int] = None
+) -> None:
+    """Reject persisted metadata that would crash or misconfigure index reload.
+
+    A persisted HNSW segment with label mappings but no valid dimensionality is
+    not recoverable at load time. The legacy code would blindly cast and pass
+    the value into hnswlib initialization, which can explode deeper in the load
+    stack instead of surfacing a normal Python exception.
+    """
+    legacy_max_seq_id = getattr(data, "max_seq_id", None)
+    if legacy_max_seq_id is not None and not _is_valid_seq_id(legacy_max_seq_id):
+        raise ValueError("Persisted local HNSW metadata has an invalid max_seq_id")
+
+    id_to_label = _require_string_keyed_map(_require_attr(data, "id_to_label"), "id_to_label")
+    label_to_id = _require_label_to_id_map(_require_attr(data, "label_to_id"))
+    id_to_seq_id = _require_string_keyed_map(_require_attr(data, "id_to_seq_id"), "id_to_seq_id")
+
+    total_elements_added = _require_attr(data, "total_elements_added")
+    if not _is_valid_historical_total(total_elements_added):
+        raise ValueError(
+            "Persisted local HNSW metadata has an invalid total_elements_added"
+        )
+
+    if not id_to_label:
+        if label_to_id or id_to_seq_id:
+            raise ValueError(
+                "Persisted local HNSW metadata is partially populated"
+            )
+        return
+
+    if len(id_to_label) != len(label_to_id):
+        raise ValueError("Persisted local HNSW label maps are inconsistent")
+
+    if len(id_to_label) != len(id_to_seq_id):
+        raise ValueError("Persisted local HNSW seq id map does not match labels")
+
+    max_label = 0
+    for user_id, label in id_to_label.items():
+        if not _is_valid_label(label):
+            raise ValueError("Persisted local HNSW metadata has an invalid label")
+
+        if label_to_id.get(label) != user_id:
+            raise ValueError("Persisted local HNSW label maps are inconsistent")
+
+        seq_id = id_to_seq_id.get(user_id)
+        if seq_id is None:
+            raise ValueError("Persisted local HNSW seq id map does not match labels")
+        if not _is_valid_seq_id(seq_id):
+            raise ValueError("Persisted local HNSW metadata has an invalid seq id")
+        max_label = max(max_label, label)
+
+    if total_elements_added < max_label:
+        raise ValueError(
+            "Persisted local HNSW total_elements_added is smaller than its labels"
+        )
+
+    dimensionality = cast(Optional[int], getattr(data, "dimensionality", None))
+    if dimensionality is None and _is_valid_dimensionality(expected_dimensionality):
+        dimensionality = expected_dimensionality
+        data.dimensionality = expected_dimensionality
+
+    if not _is_valid_dimensionality(dimensionality):
+        raise ValueError(
+            "Persisted local HNSW metadata has labels but no valid dimensionality"
+        )
+
+    if (
+        _is_valid_dimensionality(expected_dimensionality)
+        and dimensionality != expected_dimensionality
+    ):
+        raise ValueError(
+            "Persisted local HNSW metadata dimensionality does not match the "
+            "collection dimensionality"
+        )
+
+
+def _resolve_current_max_seq_id(
+    data: "PersistentData",
+    sqlite_max_seq_id: Optional[SeqId],
+    default_seq_id: SeqId,
+) -> SeqId:
+    max_persisted_seq_id = _max_persisted_seq_id(data)
+    if sqlite_max_seq_id is not None:
+        if (
+            max_persisted_seq_id is not None
+            and sqlite_max_seq_id < max_persisted_seq_id
+        ):
+            raise ValueError(
+                "Persisted local HNSW SQLite max_seq_id is smaller than its seq ids"
+            )
+        return sqlite_max_seq_id
+
+    legacy_max_seq_id = cast(Optional[SeqId], getattr(data, "max_seq_id", None))
+    if legacy_max_seq_id is not None:
+        if (
+            max_persisted_seq_id is not None
+            and legacy_max_seq_id < max_persisted_seq_id
+        ):
+            raise ValueError(
+                "Persisted local HNSW max_seq_id is smaller than its seq ids"
+            )
+        return legacy_max_seq_id
+
+    if max_persisted_seq_id is not None:
+        raise ValueError(
+            "Persisted local HNSW metadata has labels but no max_seq_id state "
+            "in SQLite or legacy metadata"
+        )
+
+    return default_seq_id
+
+
+def _atomic_pickle_dump(filename: str, value: object) -> None:
+    directory = os.path.dirname(filename) or "."
+    temp_filename: Optional[str] = None
+    try:
+        with NamedTemporaryFile(
+            mode="wb",
+            dir=directory,
+            prefix=".index_metadata.",
+            suffix=".tmp",
+            delete=False,
+        ) as metadata_file:
+            temp_filename = metadata_file.name
+            pickle.dump(value, metadata_file, pickle.HIGHEST_PROTOCOL)
+            metadata_file.flush()
+            os.fsync(metadata_file.fileno())
+        os.replace(temp_filename, filename)
+    except Exception:
+        if temp_filename is not None:
+            try:
+                os.unlink(temp_filename)
+            except FileNotFoundError:
+                pass
+        raise
+
+
 class PersistentData:
     """Stores the data and metadata needed for a PersistentLocalHnswSegment"""
 
@@ -69,10 +284,17 @@ class PersistentData:
         self.id_to_seq_id = id_to_seq_id
 
     @staticmethod
-    def load_from_file(filename: str) -> "PersistentData":
-        """Load persistent data from a file"""
+    def load_from_file(
+        filename: str, expected_dimensionality: Optional[int] = None
+    ) -> "PersistentData":
+        """Load persistent data from a file using a restricted unpickler."""
         with open(filename, "rb") as f:
-            ret = cast(PersistentData, pickle.load(f))
+            ret = SafeUnpickler(f).load()
+            if not isinstance(ret, PersistentData):
+                raise pickle.UnpicklingError(
+                    "Persisted local HNSW metadata did not deserialize to PersistentData"
+                )
+            _validate_persisted_data(ret, expected_dimensionality)
             return ret
 
 
@@ -92,6 +314,7 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
     _allow_reset: bool
 
     _db: SqliteDB
+    _sysdb: SysDB
     _opentelemtry_client: OpenTelemetryClient
 
     _num_log_records_since_last_batch: int = 0
@@ -101,6 +324,7 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
         super().__init__(system, segment)
 
         self._db = system.instance(SqliteDB)
+        self._sysdb = system.instance(SysDB)
         self._opentelemtry_client = system.require(OpenTelemetryClient)
 
         self._params = PersistentHnswParams(segment["metadata"] or {})
@@ -115,7 +339,8 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
         # Load persist data if it exists already, otherwise create it
         if self._index_exists():
             self._persist_data = PersistentData.load_from_file(
-                self._get_metadata_file()
+                self._get_metadata_file(),
+                expected_dimensionality=self._get_collection_dimensionality(),
             )
             self._dimensionality = self._persist_data.dimensionality
             self._total_elements_added = self._persist_data.total_elements_added
@@ -148,26 +373,31 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
             sql, params = get_sql(q)
             cur.execute(sql, params)
             result = cur.fetchone()
+            sqlite_max_seq_id = cast(Optional[SeqId], result[0] if result else None)
+            self._max_seq_id = _resolve_current_max_seq_id(
+                self._persist_data,
+                sqlite_max_seq_id,
+                self._consumer.min_seqid(),
+            )
 
-            if result:
-                self._max_seq_id = result[0]
-            elif self._index_exists():
-                # Migrate the max_seq_id from the legacy field in the pickled file to the SQLite database
-                q = (
-                    self._db.querybuilder()
-                    .into(Table("max_seq_id"))
-                    .columns("segment_id", "seq_id")
-                    .insert(
-                        ParameterValue(self._db.uuid_to_db(self._id)),
-                        ParameterValue(self._persist_data.max_seq_id),
-                    )
+            if not result:
+                legacy_max_seq_id = cast(
+                    Optional[SeqId], getattr(self._persist_data, "max_seq_id", None)
                 )
-                sql, params = get_sql(q)
-                cur.execute(sql, params)
-
-                self._max_seq_id = self._persist_data.max_seq_id
-            else:
-                self._max_seq_id = self._consumer.min_seqid()
+                if self._index_exists() and legacy_max_seq_id is not None:
+                    # Migrate the max_seq_id from the legacy field in the pickled file to the SQLite database
+                    q = (
+                        self._db.querybuilder()
+                        .into(Table("max_seq_id"))
+                        .columns("segment_id", "seq_id")
+                        .insert(
+                            ParameterValue(self._db.uuid_to_db(self._id)),
+                            ParameterValue(legacy_max_seq_id),
+                        )
+                    )
+                    sql, params = get_sql(q)
+                    cur.execute(sql, params)
+                    self._persist_data.max_seq_id = None
 
     @staticmethod
     @override
@@ -188,6 +418,16 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
         """Get the storage folder path"""
         folder = os.path.join(self._persist_directory, str(self._id))
         return folder
+
+    def _get_collection_dimensionality(self) -> Optional[int]:
+        if self._collection is None:
+            return None
+
+        collections = self._sysdb.get_collections(id=self._collection)
+        if len(collections) == 0:
+            return None
+
+        return cast(Optional[int], collections[0]["dimension"])
 
     @trace_method(
         "PersistentLocalHnswSegment._init_index", OpenTelemetryGranularity.ALL
@@ -251,9 +491,9 @@ class PersistentLocalHnswSegment(LocalHnswSegment):
         self._persist_data.id_to_label = self._id_to_label
         self._persist_data.label_to_id = self._label_to_id
         self._persist_data.id_to_seq_id = self._id_to_seq_id
+        self._persist_data.max_seq_id = None
 
-        with open(self._get_metadata_file(), "wb") as metadata_file:
-            pickle.dump(self._persist_data, metadata_file, pickle.HIGHEST_PROTOCOL)
+        _atomic_pickle_dump(self._get_metadata_file(), self._persist_data)
 
         with self._db.tx() as cur:
             q = (
